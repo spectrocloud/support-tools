@@ -1,0 +1,89 @@
+name: Publish Support Bundle Scripts to S3 software.spectrocloud.com
+
+on:
+    push:
+      branches:
+        - main
+      paths:
+        - 'support-bundle/*.sh'
+
+    workflow_dispatch:
+  
+env:
+   AWS_REGION: us-west-2
+   SRC_SCRIPTS_DIR: support-bundle
+   DST_SCRIPTS_DIR: scripts
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+        id-token: write
+        contents: read
+      
+    steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
+  
+        - name: Configure AWS credentials
+          uses: aws-actions/configure-aws-credentials@v4.2.0
+          with:
+            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            aws-session-token: ${{ secrets.AWS_SESSION_TOKEN || ''}}
+            aws-region: ${{ env.AWS_REGION }}
+   
+        - name: Install AWS CLI
+          run: |
+            apt-get update
+            apt-get install -y awscli
+    
+        # - name: Clean up existing files in S3
+        #   run: |
+        #     echo "Cleaning up s3://${{ secrets.S3_BUCKET_NAME }}/$DST_SCRIPTS_DIR/..."
+        #     if aws s3 ls "s3://${{ secrets.S3_BUCKET_NAME }}/$DST_SCRIPTS_DIR/" >/dev/null 2>&1; then
+        #         aws s3 rm "s3://${{ secrets.S3_BUCKET_NAME }}/$DST_SCRIPTS_DIR/" --recursive
+        #     else
+        #         echo "No existing folder to clean up."
+        #     fi
+    
+        - name: Upload scripts to S3
+          run: |
+            # Upload all .sh files from the scripts directory
+            #ls -lart 
+            aws s3 cp $SRC_SCRIPTS_DIR/ s3://${{ secrets.S3_BUCKET_NAME }}/$DST_SCRIPTS_DIR/ --recursive --exclude "*" --include "*.sh"
+
+        # - name: Verify uploaded files
+        #   run: |
+        #     # Create a temporary directory for downloaded files
+        #     mkdir -p /tmp/verify
+              
+        #     # Download all .sh files from S3
+        #     aws s3 cp s3://${{ secrets.S3_BUCKET_NAME }}/$DST_SCRIPTS_DIR/ /tmp/verify/ --recursive --exclude "*" --include "*.sh"
+              
+        #     # Compare checksums of source and uploaded files
+        #     for file in $SRC_SCRIPTS_DIR/*.sh; do
+        #       filename=$(basename "$file")
+        #       source_checksum=$(sha256sum "$file" | awk '{print $1}')
+        #       uploaded_checksum=$(sha256sum "/tmp/verify/$filename" | awk '{print $1}')
+                
+        #       if [ "$source_checksum" != "$uploaded_checksum" ]; then
+        #         echo "Error: Checksum mismatch for $filename"
+        #         echo "Source checksum: $source_checksum"
+        #         echo "Uploaded checksum: $uploaded_checksum"
+        #         exit 1
+        #       fi
+        #       echo "Verified: $filename checksums match"
+        #     done
+             
+        #     # Clean up
+        #     rm -rf /tmp/verify
+            
+        # - name: Create and upload index file
+        #   run: |
+        #     # Create index.html with list of scripts
+        #     echo "<html><body><h1>Available Scripts</h1><ul>" > index.html
+        #     aws s3 ls s3://${{ secrets.S3_BUCKET_NAME }}/${{ env.DST_SCRIPTS_DIR }}/ | grep ".sh" | awk '{print "<li><a href=\""$4"\">"$4"</a></li>"}' >> index.html
+        #     echo "</ul></body></html>" >> index.html
+              
+        #     # Upload index.html to S3
+        #     aws s3 cp index.html s3://${{ secrets.S3_BUCKET_NAME }}/${{ env.DST_SCRIPTS_DIR }}/index.html
