@@ -6,8 +6,6 @@ on:
         - main
       paths:
         - 'support-bundle/*.sh'
-
-    workflow_dispatch:
   
 env:
    AWS_REGION: us-west-2
