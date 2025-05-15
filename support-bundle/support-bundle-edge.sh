@@ -637,7 +637,7 @@ function networking-info() {
 }
 
 function help() {
-  echo "SpectroCloud Edge support bundle collector
+  echo "SpectroCloud Edge support bundle collector"
   Usage: support-bundle-edge.sh [ -s <days> ]
 
   All flags are optional
