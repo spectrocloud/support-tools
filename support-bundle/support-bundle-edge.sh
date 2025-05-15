@@ -13,15 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Version: 20250501+d24e356
+# Version: 20250515+d3e1823
 
 # set -e
 # set -x
 
 DEFAULT_KUBECONFIG="/run/kubeconfig"
-
-LOGDIR_BASE="$STYLUS_ROOT/opt/spectrocloud/logs"
-TMPDIR_BASE="$STYLUS_ROOT/usr/local/spectrocloud"
 
 JOURNALD_LOGS=(
   # edge-cluster
@@ -42,6 +39,8 @@ API_RESOURCES=(apiservices clusterroles clusterrolebindings crds csr mutatingweb
 
 API_RESOURCES_NAMESPACED=(apiservices configmaps cronjobs daemonsets deployments endpoints endpointslices events hpa ingress jobs leases limitranges networkpolicies poddisruptionbudgets pods pvc replicasets resourcequotas roles rolebindings services serviceaccounts statefulsets)
 
+VAR_LOG_LINES=500000
+
 function load-env() {
   if [ -f /etc/spectro/environment ]; then
     . /etc/spectro/environment
@@ -58,10 +57,10 @@ function techo() {
 }
 
 function setup() {
-  mkdir -p "$LOGDIR_BASE" || { echo "Failed to create $LOGDIR_BASE"; exit 1; }
-
+  TMPDIR_BASE=$(mktemp -d $MKTEMP_BASEDIR) || { techo 'Creating temporary directory failed, please check options'; exit 1; }
+  techo "Created temporary directory: $TMPDIR_BASE"
   if ! command -v hostname 2>&1 >/dev/null; then
-    echo "Hostname doesn't exist in the node. Using date timestamp instead !"
+    techo "Hostname doesn't exist in the node. Using date timestamp instead !"
     LOGNAME="$(date +'%Y-%m-%d_%H_%M_%S')"
   else
     LOGNAME="$(hostname)-$(date +'%Y-%m-%d_%H_%M_%S')"
@@ -74,18 +73,18 @@ function setup() {
 
 function defaults() {
   if [ -z "$NUM_LINES" ]; then
-    JOURNALD_FLAGS+=" -n 500000"
-    CRICTL_FLAGS+=" --tail=500000"
+    JOURNALD_FLAGS+=" -n ${VAR_LOG_LINES}"
+    CRICTL_FLAGS+=" --tail=${VAR_LOG_LINES}"
     techo "No number of log lines defined for collection. Collecting last 500k log lines from journald and crictl logs"
   fi
 }
 
 function archive() {
-  tar -czf "${LOGDIR_BASE}/${LOGNAME}.tar.gz" -C "$TMPDIR_BASE" "$LOGNAME" || {
+  tar -czf "${TMPDIR_BASE}/${LOGNAME}.tar.gz" -C "$TMPDIR_BASE" "$LOGNAME" || {
     techo "Failed to create tar file"
   }
 
-  techo "Logs are archived in ${LOGDIR_BASE}/${LOGNAME}.tar.gz"
+  techo "Logs are archived in ${TMPDIR_BASE}/${LOGNAME}.tar.gz"
   techo "Please upload the support bundle to the support ticket"
 }
 
@@ -332,22 +331,26 @@ function k8s-resources() {
   techo "Collecting k8s resources"
   mkdir -p "${TMPDIR}/k8s/cluster-resources"
   for RESOURCE in "${API_RESOURCES[@]}"; do
+    printf "\rCollecting k8s resource: %-50s" "${RESOURCE}"
     kubectl get "$RESOURCE" --all-namespaces --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/${RESOURCE}.yaml" 2>&1
   done
+  printf "\n"
 
   techo "Collecting k8s namespaced resources"
   for RESOURCE in "${API_RESOURCES_NAMESPACED[@]}"; do
     mkdir -p "${TMPDIR}/k8s/cluster-resources/${RESOURCE}"
+    printf "\rCollecting k8s namespaced resource: %-50s" "${RESOURCE}"
     for NS in "${SYSTEM_NAMESPACES[@]}"; do
       kubectl get "$RESOURCE" -n "$NS" --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/${RESOURCE}/${NS}.yaml" 2>&1
     done
   done
+  printf "\n"
 
-    techo "Collecting helm release secrets"
-    mkdir -p "${TMPDIR}/k8s/cluster-resources/secrets"
-    for NS in "${SYSTEM_NAMESPACES[@]}"; do
-      kubectl get secret -n "$NS" --field-selector type=helm.sh/release.v1 --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/secrets/${NS}.yaml" 2>&1
-    done
+  techo "Collecting helm release secrets"
+  mkdir -p "${TMPDIR}/k8s/cluster-resources/secrets"
+  for NS in "${SYSTEM_NAMESPACES[@]}"; do
+    kubectl get secret -n "$NS" --field-selector type=helm.sh/release.v1 --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/secrets/${NS}.yaml" 2>&1
+  done
 
   techo "Collecting k8s custom-resources"
   mkdir -p "${TMPDIR}/k8s/cluster-resources/custom-resources"
@@ -357,21 +360,28 @@ function k8s-resources() {
   for CRD in $CLUSTER_CRDS; do
     COUNT=$(kubectl get "$CRD" --no-headers 2>/dev/null | wc -l | xargs)
     if [ $COUNT -gt 0 ]; then
+      printf "\rCollecting k8s cluster-scoped custom-resource: %-50s" "${CRD}"
       kubectl get "$CRD" --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}.yaml" 2>&1
     fi
   done
+  printf "\n"
 
   techo "Collecting k8s namespace-scoped custom-resources"
   NAMESPACED_CRDS=$(kubectl get crd -o custom-columns=NAME:.metadata.name,SCOPE:.spec.scope --no-headers | grep "Namespaced" | awk '{print $1}')
   for CRD in $NAMESPACED_CRDS; do
-    for NS in "${SYSTEM_NAMESPACES[@]}"; do
-      COUNT=$(kubectl get "$CRD" -n "$NS" --no-headers 2>/dev/null | wc -l | xargs)
-      if [ $COUNT -gt 0 ]; then
-        mkdir -p "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}"
-        kubectl get "$CRD" -n "$NS" --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}/${NS}.yaml" 2>&1
-      fi
-    done
+    ALL_COUNT=$(kubectl get "$CRD" -A --no-headers 2>/dev/null | wc -l | xargs)
+    if [ $ALL_COUNT -gt 0 ]; then
+      printf "\rCollecting k8s namespace-scoped custom-resource: %-50s" "${CRD}"
+      for NS in "${SYSTEM_NAMESPACES[@]}"; do
+        COUNT=$(kubectl get "$CRD" -n "$NS" --no-headers 2>/dev/null | wc -l | xargs)
+        if [ $COUNT -gt 0 ]; then
+          mkdir -p "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}"
+            kubectl get "$CRD" -n "$NS" --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}/${NS}.yaml" 2>&1
+          fi
+      done
+    fi
   done
+  printf "\n"
 
   techo "Collecting k8s metrics"
   mkdir -p "${TMPDIR}/k8s/metrics"
@@ -584,13 +594,8 @@ function networking-info() {
     nft list ruleset  > $TMPDIR/networking/nft_ruleset 2>&1
   fi
   if $(command -v netstat >/dev/null 2>&1); then
-    if [ "${OSRELEASE}" = "rancheros" ]
-      then
-        netstat -antu > $TMPDIR/networking/netstat 2>&1
-      else
-        netstat --programs --all --numeric --tcp --udp > $TMPDIR/networking/netstat 2>&1
-        netstat --statistics > $TMPDIR/networking/netstatistics 2>&1
-    fi
+    netstat --programs --all --numeric --tcp --udp > $TMPDIR/networking/netstat 2>&1
+    netstat --statistics > $TMPDIR/networking/netstatistics 2>&1
   fi
   if $(command -v ipvsadm >/dev/null 2>&1); then
     ipvsadm -ln > $TMPDIR/networking/ipvsadm 2>&1
@@ -632,13 +637,13 @@ function networking-info() {
 }
 
 function help() {
-
   echo "SpectroCloud Edge support bundle collector
   Usage: support-bundle-edge.sh [ -s <days> ]
 
   All flags are optional
 
   # general flags
+  -d    Output directory for temporary storage and .tar.gz archive (ex: -d /var/tmp)
   -s    Start day of journald log collection. Specify the number of days before the current time (ex: -s 7)
   -e    End day of journald log collection. Specify the number of days before the current time (ex: -e 5)
   -S    Start date of journald log collection. (ex: -S 2024-01-01)
@@ -662,8 +667,12 @@ if [[ $EUID -ne 0 ]] && [[ "${DEV}" == "" ]]
     exit 1
 fi
 
-while getopts "s:e:S:E:l:n:r:R:j:h" opt; do
+while getopts "d:s:e:S:E:l:n:r:R:j:h" opt; do
   case $opt in
+  d)
+    MKTEMP_BASEDIR="-p ${OPTARG}"
+    techo "Using custom output directory: $MKTEMP_BASEDIR"
+    ;;
   s)
     START_DAY=${OPTARG}
     START=$(date -d "$START_DAY days ago" +%Y-%m-%d)

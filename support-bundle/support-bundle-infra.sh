@@ -13,12 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Version: 20250501+d24e356
+# Version: 20250515+d3e1823
 
 # set -e
 # set -x
-
-TMPDIR_BASE="/tmp"
 
 SYSTEM_NAMESPACES=(capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default harbor kube-system kube-public longhorn-system os-patch palette-system reach-system spectro-system system-upgrade)
 
@@ -101,8 +99,8 @@ function spectro-k8s-defaults() {
 }
 
 function k8s-resources() {
-  if ! command -v kubectl >/dev/null 2>&1; then
-    techo "k8s-resources: kubectl command not found"
+  if ! kubectl version >/dev/null 2>&1; then
+    techo "kubectl command not found"
     return
   fi
 
@@ -121,22 +119,26 @@ function k8s-resources() {
   techo "Collecting k8s resources"
   mkdir -p "${TMPDIR}/k8s/cluster-resources"
   for RESOURCE in "${API_RESOURCES[@]}"; do
+    printf "\rCollecting k8s resource: %-50s" "${RESOURCE}"
     kubectl get "$RESOURCE" --all-namespaces --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/${RESOURCE}.yaml" 2>&1
   done
+  printf "\n"
 
   techo "Collecting k8s namespaced resources"
   for RESOURCE in "${API_RESOURCES_NAMESPACED[@]}"; do
     mkdir -p "${TMPDIR}/k8s/cluster-resources/${RESOURCE}"
+    printf "\rCollecting k8s namespaced resource: %-50s" "${RESOURCE}"
     for NS in "${SYSTEM_NAMESPACES[@]}"; do
       kubectl get "$RESOURCE" -n "$NS" --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/${RESOURCE}/${NS}.yaml" 2>&1
     done
   done
+  printf "\n"
 
-    techo "Collecting helm release secrets"
-    mkdir -p "${TMPDIR}/k8s/cluster-resources/secrets"
-    for NS in "${SYSTEM_NAMESPACES[@]}"; do
-      kubectl get secret -n "$NS" --field-selector type=helm.sh/release.v1 --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/secrets/${NS}.yaml" 2>&1
-    done
+  techo "Collecting helm release secrets"
+  mkdir -p "${TMPDIR}/k8s/cluster-resources/secrets"
+  for NS in "${SYSTEM_NAMESPACES[@]}"; do
+    kubectl get secret -n "$NS" --field-selector type=helm.sh/release.v1 --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/secrets/${NS}.yaml" 2>&1
+  done
 
   techo "Collecting k8s custom-resources"
   mkdir -p "${TMPDIR}/k8s/cluster-resources/custom-resources"
@@ -146,21 +148,28 @@ function k8s-resources() {
   for CRD in $CLUSTER_CRDS; do
     COUNT=$(kubectl get "$CRD" --no-headers 2>/dev/null | wc -l | xargs)
     if [ $COUNT -gt 0 ]; then
+      printf "\rCollecting k8s cluster-scoped custom-resource: %-50s" "${CRD}"
       kubectl get "$CRD" --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}.yaml" 2>&1
     fi
   done
+  printf "\n"
 
   techo "Collecting k8s namespace-scoped custom-resources"
   NAMESPACED_CRDS=$(kubectl get crd -o custom-columns=NAME:.metadata.name,SCOPE:.spec.scope --no-headers | grep "Namespaced" | awk '{print $1}')
   for CRD in $NAMESPACED_CRDS; do
-    for NS in "${SYSTEM_NAMESPACES[@]}"; do
-      COUNT=$(kubectl get "$CRD" -n "$NS" --no-headers 2>/dev/null | wc -l | xargs)
-      if [ $COUNT -gt 0 ]; then
-        mkdir -p "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}"
-        kubectl get "$CRD" -n "$NS" --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}/${NS}.yaml" 2>&1
-      fi
-    done
+    ALL_COUNT=$(kubectl get "$CRD" -A --no-headers 2>/dev/null | wc -l | xargs)
+    if [ $ALL_COUNT -gt 0 ]; then
+      printf "\rCollecting k8s namespace-scoped custom-resource: %-50s" "${CRD}"
+      for NS in "${SYSTEM_NAMESPACES[@]}"; do
+        COUNT=$(kubectl get "$CRD" -n "$NS" --no-headers 2>/dev/null | wc -l | xargs)
+        if [ $COUNT -gt 0 ]; then
+          mkdir -p "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}"
+            kubectl get "$CRD" -n "$NS" --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}/${NS}.yaml" 2>&1
+          fi
+      done
+    fi
   done
+  printf "\n"
 
   techo "Collecting k8s metrics"
   mkdir -p "${TMPDIR}/k8s/metrics"
@@ -168,7 +177,7 @@ function k8s-resources() {
   kubectl top pods --all-namespaces > "${TMPDIR}/k8s/metrics/pods-metrics" 2>&1
   kubectl top pods --all-namespaces --containers > "${TMPDIR}/k8s/metrics/pods-containers-metrics" 2>&1
 
-  techo "Collecting logs from previous k8s pods"
+  techo "Collecting logs from previous pods"
   mkdir -p "${TMPDIR}/k8s/previous-pod-logs"
   for NS in "${SYSTEM_NAMESPACES[@]}"; do
     for POD in $(kubectl get pods -n "$NS" --no-headers -o custom-columns="NAME:.metadata.name"); do
@@ -189,17 +198,17 @@ function techo() {
   echo "$(timestamp): $*"
 }
 
-function setup-tmpdir() {
+function setup() {
   TMPDIR_BASE=$(mktemp -d $MKTEMP_BASEDIR) || { techo 'Creating temporary directory failed, please check options'; exit 1; }
-
+  techo "Created temporary directory: $TMPDIR_BASE"
   if [[ -z "${CLUSTER_NAME}" ]]; then
     CLUSTER_NAME="spectro-cluster"
   fi
 
   LOGNAME="${CLUSTER_NAME}-$(date +'%Y-%m-%d_%H_%M_%S')"
   TMPDIR="${TMPDIR_BASE}/${LOGNAME}"
-  mkdir -p "$TMPDIR"
-  techo "Created ${TMPDIR}"
+  mkdir -p "$TMPDIR" || { techo "Failed to create temporary log directory $TMPLOG_DIR"; exit 1; }
+  techo "Collecting logs in $TMPDIR"
 }
 
 function archive() {
@@ -212,13 +221,12 @@ function archive() {
 }
 
 function cleanup() {
-  rm -rf "$TMPDIR" > /dev/null 2>&1
+  rm -rf "$TMPDIR_BASE" > /dev/null 2>&1
 }
 
 function help() {
-
-  echo "SpectroCloud Infra support bundle collector
-  Usage: support-bundle-infra.sh [ flags ]
+  echo "SpectroCloud Infrastructure support bundle collector
+  Usage: support-bundle-infra.sh [ -d <directory> ]
 
   All flags are optional
 
@@ -232,10 +240,11 @@ function help() {
 
 }
 
-while getopts "n:r:R:h" opt; do
+while getopts "d:n:r:R:h" opt; do
   case $opt in
   d)
-    MKTEMP_BASEDIR=${OPTARG}
+    MKTEMP_BASEDIR="-p ${OPTARG}"
+    techo "Using custom output directory: $MKTEMP_BASEDIR"
     ;;
   n)
     NAMESPACES=${OPTARG}
@@ -261,13 +270,15 @@ while getopts "n:r:R:h" opt; do
   h)
     help && exit 0
     ;;
+  *)
+    help && exit 1
+    ;;
   esac
 done
 
 is-kubeconfig-set || { echo "KUBECONFIG is not set. Unable to collect Kubernetes logs."; cleanup; exit 1; }
 spectro-k8s-defaults
-setup-tmpdir
+setup
 k8s-resources
-
 archive
 cleanup
