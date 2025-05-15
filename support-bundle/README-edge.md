@@ -76,7 +76,7 @@ The script creates a compressed tarball (`*.tar.gz`) containing all collected lo
 
 Example: `hostname-2024-03-21_14_30_45.tar.gz`
 
-The tar archive is saved in the temporary directory by default. You can specify a different output directory using the `-d` flag when running the script.
+The tar archive is saved in `$TMPDIR` by default. You can specify a different output directory using the `-d` flag when running the script.
 
 ## Collected Information
 
