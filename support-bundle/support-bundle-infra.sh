@@ -168,7 +168,7 @@ function k8s-resources() {
   kubectl top pods --all-namespaces > "${TMPDIR}/k8s/metrics/pods-metrics" 2>&1
   kubectl top pods --all-namespaces --containers > "${TMPDIR}/k8s/metrics/pods-containers-metrics" 2>&1
 
-  techo "Collecting logs from previous pods"
+  techo "Collecting logs from previous k8s pods"
   mkdir -p "${TMPDIR}/k8s/previous-pod-logs"
   for NS in "${SYSTEM_NAMESPACES[@]}"; do
     for POD in $(kubectl get pods -n "$NS" --no-headers -o custom-columns="NAME:.metadata.name"); do
