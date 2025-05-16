@@ -70,7 +70,7 @@ function setup() {
   mkdir -p "$TMPDIR" || { echo "Failed to create temporary log directory $TMPLOG_DIR"; exit 1; }
   techo "Collecting logs in $TMPDIR"
   
-  techo "Support Bundle Version: $SB_VERSION" > "$TMPDIR/.support-bundle-info"
+  techo "Support Bundle Version: $SB_VERSION" > "$TMPDIR/.support-bundle"
 }
 
 function defaults() {
