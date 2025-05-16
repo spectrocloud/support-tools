@@ -208,8 +208,9 @@ function setup() {
   LOGNAME="${CLUSTER_NAME}-$(date +'%Y-%m-%d_%H_%M_%S')"
   TMPDIR="${TMPDIR_BASE}/${LOGNAME}"
   mkdir -p "$TMPDIR" || { techo "Failed to create temporary log directory $TMPLOG_DIR"; exit 1; }
+  
+  exec > >(tee -a "$TMPDIR/console.log") 2>&1
   techo "Collecting logs in $TMPDIR"
-
   techo "Support Bundle Version: $SB_VERSION" > "$TMPDIR/.support-bundle"
 }
 

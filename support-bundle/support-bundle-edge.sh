@@ -68,8 +68,9 @@ function setup() {
 
   TMPDIR="${TMPDIR_BASE}/${LOGNAME}"
   mkdir -p "$TMPDIR" || { echo "Failed to create temporary log directory $TMPLOG_DIR"; exit 1; }
+
+  exec > >(tee -a "$TMPDIR/console.log") 2>&1
   techo "Collecting logs in $TMPDIR"
-  
   techo "Support Bundle Version: $SB_VERSION" > "$TMPDIR/.support-bundle"
 }
 
@@ -745,7 +746,6 @@ done
 load-env
 defaults
 setup
-exec > >(tee -a "$TMPDIR/console.log") 2>&1
 sherlock
 system-info
 networking-info
