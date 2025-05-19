@@ -75,10 +75,14 @@ function setup() {
 }
 
 function defaults() {
-  if [ -z "$NUM_LINES" ]; then
+  CRICTL_FLAGS+=" --tail=${VAR_LOG_LINES}"
+  techo "Using Crictl flags: ${CRICTL_FLAGS}"
+  
+  if [ -z "$JOURNALD_FLAGS" ]; then
     JOURNALD_FLAGS+=" -n ${VAR_LOG_LINES}"
-    CRICTL_FLAGS+=" --tail=${VAR_LOG_LINES}"
     techo "No number of log lines defined for collection. Collecting last 500k log lines from journald and crictl logs"
+  else
+    techo "Using Journald flags: ${JOURNALD_FLAGS}"
   fi
 }
 
