@@ -18,7 +18,7 @@ SB_VERSION=20250516+c167119
 # set -e
 # set -x
 
-SYSTEM_NAMESPACES=(capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default harbor kube-system kube-public longhorn-system os-patch palette-system reach-system spectro-system system-upgrade)
+SYSTEM_NAMESPACES=(capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default harbor kube-system kube-public longhorn-system os-patch palette-system piraeus-system reach-system spectro-system system-upgrade zot-system)
 
 API_RESOURCES=(apiservices clusterroles clusterrolebindings crds csr mutatingwebhookconfigurations namespaces nodes priorityclasses pv storageclasses validatingwebhookconfigurations volumeattachments)
 
