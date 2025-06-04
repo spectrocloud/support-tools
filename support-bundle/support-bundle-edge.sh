@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-SB_VERSION=20250521+d5b6fff
+SB_VERSION=20250604+28c05d6
 
 # set -e
 # set -x
