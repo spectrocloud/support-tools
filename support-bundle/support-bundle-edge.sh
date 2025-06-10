@@ -181,7 +181,11 @@ function kubectl() {
 function var-log() {
   techo "Collecting logs from /var/log"
   mkdir -p $TMPDIR/var/log
-  cp -p /var/log/*log* "$TMPDIR/var/log" 2>&1
+  for logfile in /var/log/*log*; do
+    if file "$logfile" | grep -q "text"; then
+      cp -p "$logfile" "$TMPDIR/var/log" 2>&1
+    fi
+  done
 }
 
 function journald-log() {
