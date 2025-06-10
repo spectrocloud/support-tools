@@ -241,6 +241,30 @@ function stylus-files() {
   mkdir -p $TMPDIR/run/immucore
   ls -lah /run/immucore/ > $TMPDIR/run/immucore/files 2>&1
   cp -prf /run/immucore/* $TMPDIR/run/immucore 2>&1
+
+# collect content from /opt/spectrocloud/bin-checksums/*
+  techo "Collecting content from /opt/spectrocloud/bin-checksums/*"
+  mkdir -p $TMPDIR/opt/spectrocloud/bin-checksums
+  for file in /opt/spectrocloud/bin-checksums/*; do
+    if [ -f "$file" ]; then
+      cp -p "$file" "$TMPDIR/opt/spectrocloud/bin-checksums" 2>&1
+    fi
+  done
+
+  #  check if sha256sum is installed
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    techo "sha256sum command not found"
+    return
+  fi
+
+  # collect checksums for /opt/spectrocloud/bin/*
+  techo "Collecting checksums for /opt/spectrocloud/bin/*"
+  mkdir -p $TMPDIR/opt/spectrocloud/bin
+  for file in /opt/spectrocloud/bin/*; do
+    if [ -f "$file" ]; then
+      sha256sum "$file" > "$TMPDIR/opt/spectrocloud/bin/$(basename $file).sha256" 2>&1
+    fi
+  done
 }
 
 function set-kubeconfig() {
