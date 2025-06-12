@@ -181,7 +181,11 @@ function kubectl() {
 function var-log() {
   techo "Collecting logs from /var/log"
   mkdir -p $TMPDIR/var/log
-  cp -p /var/log/*log* "$TMPDIR/var/log" 2>&1
+  for logfile in /var/log/*log*; do
+    if file "$logfile" | grep -q "text"; then
+      cp -p "$logfile" "$TMPDIR/var/log" 2>&1
+    fi
+  done
 }
 
 function journald-log() {
@@ -237,6 +241,34 @@ function stylus-files() {
   mkdir -p $TMPDIR/run/immucore
   ls -lah /run/immucore/ > $TMPDIR/run/immucore/files 2>&1
   cp -prf /run/immucore/* $TMPDIR/run/immucore 2>&1
+
+# collect content from /opt/spectrocloud/bin-checksums/*
+  techo "Collecting content from /opt/spectrocloud/bin-checksums/*"
+  mkdir -p $TMPDIR/opt/spectrocloud/bin-checksums
+  for file in /opt/spectrocloud/bin-checksums/*; do
+    if [ -f "$file" ]; then
+      cp -p "$file" "$TMPDIR/opt/spectrocloud/bin-checksums" 2>&1
+    fi
+  done
+
+  #  check if sha256sum is installed, fallback to openssl
+  if command -v sha256sum >/dev/null 2>&1; then
+    CHECKSUM_CMD="sha256sum"
+  elif command -v openssl >/dev/null 2>&1; then
+    CHECKSUM_CMD="openssl dgst -sha256"
+  else
+    techo "Neither sha256sum nor openssl commands found"
+    return
+  fi
+
+  # collect checksums for /opt/spectrocloud/bin/*
+  techo "Collecting checksums for /opt/spectrocloud/bin/* using $CHECKSUM_CMD"
+  mkdir -p $TMPDIR/opt/spectrocloud/bin
+  for file in /opt/spectrocloud/bin/*; do
+    if [ -f "$file" ]; then
+      $CHECKSUM_CMD "$file" > "$TMPDIR/opt/spectrocloud/bin/$(basename $file).sha256" 2>&1
+    fi
+  done
 }
 
 function set-kubeconfig() {
