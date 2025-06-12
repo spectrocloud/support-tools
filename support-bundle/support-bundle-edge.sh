@@ -251,18 +251,22 @@ function stylus-files() {
     fi
   done
 
-  #  check if sha256sum is installed
-  if ! command -v sha256sum >/dev/null 2>&1; then
-    techo "sha256sum command not found"
+  #  check if sha256sum is installed, fallback to openssl
+  if command -v sha256sum >/dev/null 2>&1; then
+    CHECKSUM_CMD="sha256sum"
+  elif command -v openssl >/dev/null 2>&1; then
+    CHECKSUM_CMD="openssl dgst -sha256"
+  else
+    techo "Neither sha256sum nor openssl commands found"
     return
   fi
 
   # collect checksums for /opt/spectrocloud/bin/*
-  techo "Collecting checksums for /opt/spectrocloud/bin/*"
+  techo "Collecting checksums for /opt/spectrocloud/bin/* using $CHECKSUM_CMD"
   mkdir -p $TMPDIR/opt/spectrocloud/bin
   for file in /opt/spectrocloud/bin/*; do
     if [ -f "$file" ]; then
-      sha256sum "$file" > "$TMPDIR/opt/spectrocloud/bin/$(basename $file).sha256" 2>&1
+      $CHECKSUM_CMD "$file" > "$TMPDIR/opt/spectrocloud/bin/$(basename $file).sha256" 2>&1
     fi
   done
 }
