@@ -33,7 +33,7 @@ JOURNALD_LOGS=(
   cos-setup-boot
   )
 
-SYSTEM_NAMESPACES=(capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default harbor kube-system kube-public longhorn-system os-patch palette-system piraeus-system reach-system spectro-system system-upgrade zot-system)
+SYSTEM_NAMESPACES=(capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default harbor kube-system kube-public longhorn-system os-patch palette-system piraeus-system reach-system spectro-system spectro-task system-upgrade zot-system)
 
 API_RESOURCES=(apiservices clusterroles clusterrolebindings crds csr mutatingwebhookconfigurations namespaces nodes priorityclasses pv storageclasses validatingwebhookconfigurations volumeattachments)
 
@@ -337,6 +337,16 @@ function spectro-k8s-defaults() {
     techo "System upgrade UUID namespace is empty."
   else
     for NS in $(echo $SYSTEM_UPGRADE_UUID_NS | tr " " "\n"); do
+      techo "Adding namespace $NS for logs collection."
+      SYSTEM_NAMESPACES+=("$NS")
+    done
+  fi
+
+  SPECTRO_TASK_NS=$(kubectl get ns -o=name | grep '^namespace/spectro-task-' | sed "s/^.\{10\}//")
+  if [[ -z "${SPECTRO_TASK_NS}" ]]; then
+    techo "Spectro task UUID namespace is empty."
+  else
+    for NS in $(echo $SPECTRO_TASK_NS | tr " " "\n"); do
       techo "Adding namespace $NS for logs collection."
       SYSTEM_NAMESPACES+=("$NS")
     done
