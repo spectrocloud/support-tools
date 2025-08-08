@@ -45,7 +45,7 @@ function spectro-k8s-defaults() {
 	fi
 
 	IS_PCG_CLUSTER=false
-	if kubectl get deployment -n jet-system --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null | grep 'spectro-cloud-driver'; then
+	if [[ "$IS_ENTERPRISE_CLUSTER" == false ]] && kubectl get deployment -n jet-system --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null | grep 'jet'; then
 		IS_PCG_CLUSTER=true
     CLUSTER_NAME="spectro-pcg-cluster"
 		techo "This is a PCG cluster. Collecting logs from all namespaces"
