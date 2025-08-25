@@ -28,7 +28,7 @@ JOURNALD_LOGS=(
   # system
   systemd-timesyncd
   # k8s
-  containerd kubelet k3s k3s-agent rke2-server rke2-agent
+  containerd spectro-containerd kubelet k3s k3s-agent rke2-server rke2-agent
   # Kairos specific services
   cos-setup-boot
   )
