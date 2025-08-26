@@ -242,6 +242,58 @@ function stylus-files() {
   ls -lah /run/immucore/ > $TMPDIR/run/immucore/files 2>&1
   cp -prf /run/immucore/* $TMPDIR/run/immucore 2>&1
 
+  # collect bundle-pkg index.json if exists
+  techo "Collecting bundle-pkg index.json if exists"
+  if [ -f "/usr/local/spectrocloud/bundle/bundle-pkg/index.json" ]; then
+    mkdir -p $TMPDIR/usr/local/spectrocloud/bundle/bundle-pkg
+    cp -p "/usr/local/spectrocloud/bundle/bundle-pkg/index.json" "$TMPDIR/usr/local/spectrocloud/bundle/bundle-pkg/" 2>&1
+    techo "Collected bundle-pkg index.json"
+  else
+    techo "bundle-pkg index.json not found at /usr/local/spectrocloud/bundle/bundle-pkg/index.json"
+  fi
+
+  # collect containerd config.toml if exists
+  techo "Collecting containerd config.toml if exists"
+  if [ -f "/etc/containerd/config.toml" ]; then
+    mkdir -p $TMPDIR/etc/containerd
+    cp -p "/etc/containerd/config.toml" "$TMPDIR/etc/containerd/" 2>&1
+    techo "Collected containerd config.toml"
+  else
+    techo "containerd config.toml not found at /etc/containerd/config.toml"
+  fi
+
+  # collect containerd conf.d/*.toml files if they exist
+  techo "Collecting containerd conf.d/*.toml files if they exist"
+  if [ -d "/etc/containerd/conf.d" ]; then
+    mkdir -p $TMPDIR/etc/containerd/conf.d
+    ls -lah /etc/containerd/conf.d/ > "$TMPDIR/etc/containerd/conf.d/files" 2>&1
+    
+    # collect all .toml files from conf.d directory
+    for file in /etc/containerd/conf.d/*.toml; do
+      if [ -f "$file" ]; then
+        cp -p "$file" "$TMPDIR/etc/containerd/conf.d/" 2>&1
+        techo "Collected containerd config file: $(basename $file)"
+      fi
+    done
+    
+    # check if any .toml files were found
+    if [ -z "$(ls -A $TMPDIR/etc/containerd/conf.d/*.toml 2>/dev/null)" ]; then
+      techo "No .toml files found in /etc/containerd/conf.d/"
+    fi
+  else
+    techo "containerd conf.d directory not found at /etc/containerd/conf.d"
+  fi
+
+  # collect bundle directory listing
+  techo "Collecting bundle directory listing"
+  if [ -d "/usr/local/spectrocloud/bundle" ]; then
+    mkdir -p $TMPDIR/usr/local/spectrocloud/bundle
+    ls -larthR /usr/local/spectrocloud/bundle/ > "$TMPDIR/usr/local/spectrocloud/bundle/directory-listing.txt" 2>&1
+    techo "Collected bundle directory listing"
+  else
+    techo "bundle directory not found at /usr/local/spectrocloud/bundle"
+  fi
+
 # collect content from /opt/spectrocloud/bin-checksums/*
   techo "Collecting content from /opt/spectrocloud/bin-checksums/*"
   mkdir -p $TMPDIR/opt/spectrocloud/bin-checksums
