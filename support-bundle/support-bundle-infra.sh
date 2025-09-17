@@ -108,6 +108,33 @@ function spectro-k8s-defaults() {
 	fi
 }
 
+function mongo-status() {
+  [[ "$IS_ENTERPRISE_CLUSTER" != true ]] && return
+  
+  techo "Collecting MongoDB status"
+  mkdir -p "${TMPDIR}/mongo"
+
+  local db_password=$(kubectl get secrets configserversecret -o jsonpath="{.data.dbPassword}" -n hubble-system 2>/dev/null | base64 -d 2>/dev/null)
+  
+  if [[ -z "$db_password" ]]; then
+    echo "Failed to retrieve MongoDB password" > "${TMPDIR}/mongo/status.txt"
+    return
+  fi
+
+  # Find a running mongo pod
+  local mongo_pod=$(kubectl get pods -n hubble-system --field-selector=status.phase=Running -o custom-columns="NAME:.metadata.name" --no-headers | grep mongo | head -1)
+  
+  if [[ -z "$mongo_pod" ]]; then
+    echo "No running MongoDB pods found in hubble-system namespace" > "${TMPDIR}/mongo/status.txt"
+    return
+  fi
+  
+  techo "Using MongoDB pod: $mongo_pod"
+  
+  techo "Collecting MongoDB replica set status"
+  kubectl exec -n hubble-system $mongo_pod -c mongo -- bash -c "mongo admin -u root -p $db_password --authenticationDatabase admin --quiet --eval 'print(JSON.stringify(rs.status()))'" > "${TMPDIR}/mongo/rs-status.json" 2>&1
+}
+
 function k8s-resources() {
   if ! kubectl version >/dev/null 2>&1; then
     techo "kubectl command not found"
@@ -293,5 +320,6 @@ is-kubeconfig-set || { echo "KUBECONFIG is not set. Unable to collect Kubernetes
 spectro-k8s-defaults
 setup
 k8s-resources
+mongo-status
 archive
 cleanup
