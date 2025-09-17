@@ -411,6 +411,33 @@ function spectro-k8s-defaults() {
 	fi
 }
 
+function mongo-status() {
+  [[ "$IS_ENTERPRISE_CLUSTER" != true ]] && return
+  
+  techo "Collecting MongoDB status"
+  mkdir -p "${TMPDIR}/mongo"
+
+  local db_password=$(kubectl get secrets configserversecret -o jsonpath="{.data.dbPassword}" -n hubble-system 2>/dev/null | base64 -d 2>/dev/null)
+  
+  if [[ -z "$db_password" ]]; then
+    echo "Failed to retrieve MongoDB password" > "${TMPDIR}/mongo/status.txt"
+    return
+  fi
+
+  # Find a running mongo pod
+  local mongo_pod=$(kubectl get pods -n hubble-system --field-selector=status.phase=Running -o custom-columns="NAME:.metadata.name" --no-headers | grep mongo | head -1)
+  
+  if [[ -z "$mongo_pod" ]]; then
+    echo "No running MongoDB pods found in hubble-system namespace" > "${TMPDIR}/mongo/status.txt"
+    return
+  fi
+  
+  techo "Using MongoDB pod: $mongo_pod"
+  
+  techo "Collecting MongoDB replica set status"
+  kubectl exec -n hubble-system $mongo_pod -c mongo -- bash -c "mongo admin -u root -p $db_password --authenticationDatabase admin --quiet --eval 'print(JSON.stringify(rs.status()))'" > "${TMPDIR}/mongo/rs-status.json" 2>&1
+}
+
 function k8s-resources() {
   if ! kubectl version >/dev/null 2>&1; then
     techo "kubectl command not found"
@@ -534,7 +561,7 @@ function kubeadm-manifests() {
   ls -lah /etc/kubernetes/manifests/ > $TMPDIR/etc/kubernetes/manifests/files 2>&1
   cp -p /etc/kubernetes/manifests/* $TMPDIR/etc/kubernetes/manifests 2>&1
 
-    if ! $(command -v kubeadm >/dev/null 2>&1); then
+    if ! command -v kubeadm >/dev/null 2>&1; then
     techo "kubeadm-manifests: kubeadm command not found"
     return
   fi
@@ -543,7 +570,7 @@ function kubeadm-manifests() {
 
 function kubeadm-certs() {
 
-  if ! $(command -v openssl >/dev/null 2>&1); then
+  if ! command -v openssl >/dev/null 2>&1; then
     techo "kubeadm-certs: openssl command not found"
     return
   fi
@@ -578,7 +605,7 @@ function kubeadm-etcd() {
   KUBEADM_ETCD_DIR="/etc/kubernetes"
   KUBEADM_ETCD_CERTS="/etc/kubernetes/pki/etcd/"
 
-  if ! $(command -v etcdctl >/dev/null 2>&1); then
+  if ! command -v etcdctl >/dev/null 2>&1; then
     techo "kubeadm-etcd: etcdctl command not found"
     return
   fi
@@ -693,21 +720,21 @@ function networking-info() {
   ip6tables $IPTABLES_FLAGS --numeric --verbose --list --table mangle > $TMPDIR/networking/ip6tablesmangle 2>&1
   ip6tables $IPTABLES_FLAGS --numeric --verbose --list --table nat > $TMPDIR/networking/ip6tablesnat 2>&1
   ip6tables $IPTABLES_FLAGS --numeric --verbose --list > $TMPDIR/networking/ip6tables 2>&1
-  if $(command -v nft >/dev/null 2>&1); then
+  if command -v nft >/dev/null 2>&1; then
     nft list ruleset  > $TMPDIR/networking/nft_ruleset 2>&1
   fi
-  if $(command -v netstat >/dev/null 2>&1); then
+  if command -v netstat >/dev/null 2>&1; then
     netstat --programs --all --numeric --tcp --udp > $TMPDIR/networking/netstat 2>&1
     netstat --statistics > $TMPDIR/networking/netstatistics 2>&1
   fi
-  if $(command -v ipvsadm >/dev/null 2>&1); then
+  if command -v ipvsadm >/dev/null 2>&1; then
     ipvsadm -ln > $TMPDIR/networking/ipvsadm 2>&1
   fi
   if [ -f /proc/net/xfrm_stat ]
     then
       cat /proc/net/xfrm_stat > $TMPDIR/networking/procnetxfrmstat 2>&1
   fi
-  if $(command -v ip >/dev/null 2>&1); then
+  if command -v ip >/dev/null 2>&1; then
     ip addr show > $TMPDIR/networking/ipaddrshow 2>&1
     ip route show table all > $TMPDIR/networking/iproute 2>&1
     ip neighbour > $TMPDIR/networking/ipneighbour 2>&1
@@ -718,10 +745,10 @@ function networking-info() {
     ip -6 route show > $TMPDIR/networking/ipv6route 2>&1
     ip -6 addr show > $TMPDIR/networking/ipv6addrshow 2>&1
   fi
-  if $(command -v ifconfig >/dev/null 2>&1); then
+  if command -v ifconfig >/dev/null 2>&1; then
     ifconfig -a > $TMPDIR/networking/ifconfiga
   fi
-  if $(command -v ss >/dev/null 2>&1); then
+  if command -v ss >/dev/null 2>&1; then
     ss -anp > $TMPDIR/networking/ssanp 2>&1
     ss -itan > $TMPDIR/networking/ssitan 2>&1
     ss -uapn > $TMPDIR/networking/ssuapn 2>&1
@@ -876,6 +903,8 @@ if [ "${DISTRO}" = "rke2" ]; then
   rke2-certs
   # TODO: rke2 manifests, certs, etcd collection and logs
 fi
+
+mongo-status
 
 helm-logs
 archive
