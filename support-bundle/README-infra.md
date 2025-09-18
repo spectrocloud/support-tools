@@ -31,14 +31,26 @@ Basic usage:
 ./support-bundle-infra.sh
 ```
 
-## Configuration
+Advanced usage with additional collection options:
+```bash
+./support-bundle-infra.sh -n hello-universe,hello-world -r certificates.cert-manager.io -R clusterissuers.cert-manager.io 
+```
 
-The script uses the following configuration:
+## Available Flags
 
-* `-d`: Output directory for temporary storage and .tar.gz archive (ex: -d /var/tmp)
-* `KUBECONFIG`: Environment variable specifying the path to the Kubernetes configuration file
-* `tmp_bundle_dir`: Temporary directory for storing intermediate logs
-* `namespaces`: Array of Kubernetes namespaces to include in log collection
+All flags are optional:
+
+| Flag | Description | Example |
+|------|-------------|---------|
+| `-d` | Output directory for temporary storage and .tar.gz archive | `-d /var/tmp` |
+| `-n` | Additional namespaces to collect logs from. | `-n hello-universe,hello-world` |
+| `-r` | Additional namespace scoped resources to collect. | `-r certificates.cert-manager.io,clusterissuers.cert-manager.io` |
+| `-R` | Additional cluster scoped resources to collect. | `-R clusterissuers.cert-manager.io,clusterissuers.cert-manager.io` |
+
+## Environment Variables
+
+* `KUBECONFIG`: Path to the Kubernetes configuration file
+
 
 ## Output
 

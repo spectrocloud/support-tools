@@ -239,7 +239,7 @@ function cleanup() {
 
 function help() {
   echo "SpectroCloud Infrastructure support bundle collector
-  Usage: support-bundle-infra.sh [ -d <directory> ]
+  Usage: support-bundle-infra.sh [ flags ]
 
   All flags are optional
 
