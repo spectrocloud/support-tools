@@ -29,6 +29,9 @@ JOURNALD_LOGS=(
   systemd-timesyncd
   # k8s
   containerd spectro-containerd kubelet k3s k3s-agent rke2-server rke2-agent
+  # Canonical Kubernetes (snap-based) common units
+  k8s.kubelet k8s.kube-apiserver k8s.kube-controller-manager k8s.kube-scheduler k8s.kube-proxy
+  snap.k8s.kubelet snap.k8s.kube-apiserver snap.k8s.kube-controller-manager snap.k8s.kube-scheduler snap.k8s.kube-proxy
   # Kairos specific services
   cos-setup-boot
   )
@@ -74,6 +77,23 @@ function setup() {
   techo "Support Bundle Version: $SB_VERSION" > "$TMPDIR/.support-bundle"
 }
 
+function canonical-k8s-setup() {
+  CK8S_CURRENT_DIR="/var/snap/k8s/current"
+  CK8S_COMMON_DIR="/var/snap/k8s/common"
+
+  # Configure CRI for Canonical k8s snap if available
+  if [ -z "${CRI_CONFIG_FILE}" ] && [ -f "${CK8S_CURRENT_DIR}/args/crictl.yaml" ]; then
+    export CRI_CONFIG_FILE="${CK8S_CURRENT_DIR}/args/crictl.yaml"
+    techo "Using Canonical k8s crictl config at ${CRI_CONFIG_FILE}"
+  elif [ -z "${CONTAINER_RUNTIME_ENDPOINT}" ] && [ -S "${CK8S_COMMON_DIR}/run/containerd.sock" ]; then
+    export CONTAINER_RUNTIME_ENDPOINT="unix://${CK8S_COMMON_DIR}/run/containerd.sock"
+    techo "Using Canonical k8s containerd socket at ${CONTAINER_RUNTIME_ENDPOINT}"
+  elif [ -z "${CONTAINER_RUNTIME_ENDPOINT}" ] && [ -S "/run/containerd/containerd.sock" ]; then
+    export CONTAINER_RUNTIME_ENDPOINT="unix:///run/containerd/containerd.sock"
+    techo "Using default containerd socket at ${CONTAINER_RUNTIME_ENDPOINT}"
+  fi
+}
+
 function defaults() {
   CRICTL_FLAGS+=" --tail=${VAR_LOG_LINES}"
   techo "Using Crictl flags: ${CRICTL_FLAGS}"
@@ -116,6 +136,12 @@ function sherlock() {
     else
       FOUND+="rke2"
     fi
+  elif [ -d "/var/snap/k8s" ] || \
+       systemctl list-units --full -all 2>/dev/null | grep -Fq "k8s.kubelet.service" || \
+       systemctl list-units --full -all 2>/dev/null | grep -Fq "snap.k8s.kubelet.service" || \
+       (command -v snap >/dev/null 2>&1 && snap list 2>/dev/null | grep -q "^k8s "); then
+    canonical-k8s-setup
+    DISTRO="canonical"
   else
     techo "Could not detect K8s distribution."
   fi
@@ -323,12 +349,47 @@ function stylus-files() {
   done
 }
 
+function canonical-k8s-files() {
+  techo "Collecting Canonical k8s snap files"
+  CK8S_CURRENT_DIR="/var/snap/k8s/current"
+  CK8S_COMMON_DIR="/var/snap/k8s/common"
+
+  mkdir -p $TMPDIR/canonical-k8s
+
+  if [ -d "${CK8S_CURRENT_DIR}/args" ]; then
+    mkdir -p $TMPDIR/canonical-k8s/args
+    ls -lah "${CK8S_CURRENT_DIR}/args" > $TMPDIR/canonical-k8s/args/files 2>&1
+    cp -prf "${CK8S_CURRENT_DIR}/args"/* $TMPDIR/canonical-k8s/args 2>&1
+  fi
+
+  if [ -d "${CK8S_CURRENT_DIR}/certs" ]; then
+    mkdir -p $TMPDIR/canonical-k8s/certs
+    ls -lah "${CK8S_CURRENT_DIR}/certs" > $TMPDIR/canonical-k8s/certs/files 2>&1
+    cp -prf "${CK8S_CURRENT_DIR}/certs"/* $TMPDIR/canonical-k8s/certs 2>&1
+  fi
+
+  if [ -d "${CK8S_CURRENT_DIR}/credentials" ]; then
+    mkdir -p $TMPDIR/canonical-k8s/credentials
+    ls -lah "${CK8S_CURRENT_DIR}/credentials" > $TMPDIR/canonical-k8s/credentials/files 2>&1
+    cp -prf "${CK8S_CURRENT_DIR}/credentials"/* $TMPDIR/canonical-k8s/credentials 2>&1
+  fi
+
+  if [ -d "${CK8S_COMMON_DIR}/etc/containerd" ]; then
+    mkdir -p $TMPDIR/canonical-k8s/containerd
+    ls -lah "${CK8S_COMMON_DIR}/etc/containerd" > $TMPDIR/canonical-k8s/containerd/files 2>&1
+    cp -prf "${CK8S_COMMON_DIR}/etc/containerd"/* $TMPDIR/canonical-k8s/containerd 2>&1
+  fi
+}
+
 function set-kubeconfig() {
   if [ -n "$KUBECONFIG" ]; then
     techo "Using env KUBECONFIG: $KUBECONFIG"
   elif [ -f "$DEFAULT_KUBECONFIG" ]; then
     export KUBECONFIG="$DEFAULT_KUBECONFIG"
     techo "KUBECONFIG file exists and is readable. Defaulting to $KUBECONFIG"
+  elif [ -f "/etc/kubernetes/admin.conf" ]; then
+    export KUBECONFIG="/etc/kubernetes/admin.conf"
+    techo "Using kubeadm admin.conf as KUBECONFIG"
   else
     techo "KUBECONFIG file ($DEFAULT_KUBECONFIG) does not exist."
   fi
@@ -603,6 +664,47 @@ function kubeadm-etcd() {
 
 }
 
+
+
+function canonical-k8s-dqlite() {
+  techo "Collecting Canonical k8s dqlite info"
+  DQLITE_DIR="/var/snap/k8s/common/var/lib/k8s-dqlite"
+  K8SD_DIR="/var/snap/k8s/common/var/lib/k8sd/state"
+  
+  mkdir -p "$TMPDIR/dqlite"
+  
+  # Collect dqlite cluster info and certificates
+  if [ -d "${DQLITE_DIR}" ]; then
+    ls -lah "${DQLITE_DIR}" > "$TMPDIR/dqlite/dqlite-files" 2>&1
+    
+    # Copy dqlite certificates (parsed, not raw keys)
+    if [ -f "${DQLITE_DIR}/cluster.crt" ] && command -v openssl >/dev/null 2>&1; then
+      openssl x509 -in "${DQLITE_DIR}/cluster.crt" -text -noout > "$TMPDIR/dqlite/cluster-cert-info" 2>&1
+    fi
+  fi
+  
+  # Collect k8sd state info
+  if [ -d "${K8SD_DIR}" ]; then
+    ls -lah "${K8SD_DIR}" > "$TMPDIR/dqlite/k8sd-state-files" 2>&1
+    
+    # Copy k8sd certificates (parsed, not raw keys)  
+    if [ -f "${K8SD_DIR}/cluster.crt" ] && command -v openssl >/dev/null 2>&1; then
+      openssl x509 -in "${K8SD_DIR}/cluster.crt" -text -noout > "$TMPDIR/dqlite/k8sd-cluster-cert-info" 2>&1
+    fi
+    if [ -f "${K8SD_DIR}/server.crt" ] && command -v openssl >/dev/null 2>&1; then
+      openssl x509 -in "${K8SD_DIR}/server.crt" -text -noout > "$TMPDIR/dqlite/k8sd-server-cert-info" 2>&1
+    fi
+  fi
+}
+
+function canonical-k8s-snap-info() {
+  if ! command -v snap >/dev/null 2>&1; then
+    return
+  fi
+  mkdir -p "$TMPDIR/snap"
+  snap info k8s > "$TMPDIR/snap/k8s-info" 2>&1
+}
+
 function rke2-certs() {
 
   if [ -d ${RKE2_DATA_DIR} ]
@@ -875,6 +977,14 @@ fi
 if [ "${DISTRO}" = "rke2" ]; then
   rke2-certs
   # TODO: rke2 manifests, certs, etcd collection and logs
+fi
+
+if [ "${DISTRO}" = "canonical" ]; then
+  canonical-k8s-files
+  var-log-pods
+  kubeadm-certs
+  canonical-k8s-dqlite
+  canonical-k8s-snap-info
 fi
 
 helm-logs
