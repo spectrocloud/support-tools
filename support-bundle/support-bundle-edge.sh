@@ -36,7 +36,7 @@ JOURNALD_LOGS=(
   cos-setup-boot
   )
 
-SYSTEM_NAMESPACES=(capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default harbor kube-system kube-public longhorn-system os-patch palette-system piraeus-system reach-system spectro-system spectro-task system-upgrade zot-system)
+SYSTEM_NAMESPACES=(capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default harbor kube-system kube-public kubevirt longhorn-system os-patch palette-system piraeus-system reach-system rook-ceph spectro-system spectro-task system-upgrade vm-dashboard zot-system)
 
 API_RESOURCES=(apiservices clusterroles clusterrolebindings crds csr mutatingwebhookconfigurations namespaces nodes priorityclasses pv storageclasses validatingwebhookconfigurations volumeattachments)
 
