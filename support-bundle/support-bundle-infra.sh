@@ -358,7 +358,7 @@ done
 is-kubeconfig-set || { echo "KUBECONFIG is not set. Unable to collect Kubernetes logs."; cleanup; exit 1; }
 spectro-k8s-defaults
 setup
-# k8s-resources
+k8s-resources
 mongo-status
 archive
 cleanup
