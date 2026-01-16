@@ -472,6 +472,72 @@ function spectro-k8s-defaults() {
 	fi
 }
 
+function mongo-status() {
+  [[ "$IS_ENTERPRISE_CLUSTER" != true ]] && return
+  
+  techo "Collecting MongoDB status"
+  mkdir -p "${TMPDIR}/mongo"
+
+  # Find all running mongo pods
+  MONGO_PODS=$(kubectl get pods -n hubble-system --field-selector=status.phase=Running -o custom-columns="NAME:.metadata.name" --no-headers | grep mongo)
+  
+  if [[ -z "$MONGO_PODS" ]]; then
+    echo "No running MongoDB pods found in hubble-system namespace" > "${TMPDIR}/mongo/status.txt"
+    return
+  fi
+
+  # Use first pod to detect mongo shell and auth method
+  FIRST_POD=$(echo "$MONGO_PODS" | head -1)
+
+  # Try mongosh first, fall back to mongo for older versions
+  if kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongosh >/dev/null 2>&1; then
+    MONGO_CMD="mongosh"
+  else
+    MONGO_CMD="mongo"
+  fi
+  techo "Using MongoDB shell: $MONGO_CMD"
+
+  # Check if TLS is enabled (VerteX EC cluster)
+  if kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- test -f /var/mongodb/tls/ca.crt 2>/dev/null; then
+    techo "Detected VerteX EC cluster (TLS enabled)"
+    MONGO_AUTH='-u $MONGODB_INITDB_ROOT_USERNAME -p $MONGODB_INITDB_ROOT_PASSWORD --host $HOSTNAME --tls --tlsCAFile /var/mongodb/tls/ca.crt --tlsCertificateKeyFile /var/mongodb/tls/tls-combined.pem --tlsAllowInvalidHostnames'
+  else
+    techo "Detected standard EC cluster"
+    DB_PASSWORD=$(kubectl get secret spectromongosecret -o jsonpath="{.data.mongoRootPassword}" -n hubble-system 2>/dev/null | base64 -d 2>/dev/null)
+    if [[ -z "$DB_PASSWORD" ]]; then
+      echo "Failed to retrieve MongoDB password" > "${TMPDIR}/mongo/status.txt"
+      return
+    fi
+    MONGO_AUTH="-u root -p $DB_PASSWORD --authenticationDatabase admin"
+  fi
+
+  # Find a pod that's part of the replica set
+  MONGO_POD=""
+  for POD in $MONGO_PODS; do
+    techo "Trying MongoDB pod: $POD"
+    if kubectl exec -n hubble-system "$POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'rs.status()'" >/dev/null 2>&1; then
+      MONGO_POD="$POD"
+      techo "Using MongoDB pod: $MONGO_POD (replica set member)"
+      break
+    fi
+    techo "Pod $POD is not a replica set member, trying next..."
+  done
+
+  if [[ -z "$MONGO_POD" ]]; then
+    echo "No MongoDB pods found that are part of the replica set" > "${TMPDIR}/mongo/status.txt"
+    return
+  fi
+
+  techo "Collecting MongoDB replica set status"
+  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'JSON.stringify(rs.status(), null, 2)'" > "${TMPDIR}/mongo/rs-status.json" 2>&1
+
+  techo "Collecting MongoDB replica set configuration"
+  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'JSON.stringify(rs.conf(), null, 2)'" > "${TMPDIR}/mongo/rs-conf.json" 2>&1
+
+  techo "Collecting MongoDB replication info"
+  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'rs.printReplicationInfo()'" > "${TMPDIR}/mongo/replication-info.txt" 2>&1
+}
+
 function k8s-resources() {
   if ! kubectl version >/dev/null 2>&1; then
     techo "kubectl command not found"
@@ -595,7 +661,7 @@ function kubeadm-manifests() {
   ls -lah /etc/kubernetes/manifests/ > $TMPDIR/etc/kubernetes/manifests/files 2>&1
   cp -p /etc/kubernetes/manifests/* $TMPDIR/etc/kubernetes/manifests 2>&1
 
-    if ! $(command -v kubeadm >/dev/null 2>&1); then
+    if ! command -v kubeadm >/dev/null 2>&1; then
     techo "kubeadm-manifests: kubeadm command not found"
     return
   fi
@@ -604,7 +670,7 @@ function kubeadm-manifests() {
 
 function kubeadm-certs() {
 
-  if ! $(command -v openssl >/dev/null 2>&1); then
+  if ! command -v openssl >/dev/null 2>&1; then
     techo "kubeadm-certs: openssl command not found"
     return
   fi
@@ -639,7 +705,7 @@ function kubeadm-etcd() {
   KUBEADM_ETCD_DIR="/etc/kubernetes"
   KUBEADM_ETCD_CERTS="/etc/kubernetes/pki/etcd/"
 
-  if ! $(command -v etcdctl >/dev/null 2>&1); then
+  if ! command -v etcdctl >/dev/null 2>&1; then
     techo "kubeadm-etcd: etcdctl command not found"
     return
   fi
@@ -795,21 +861,21 @@ function networking-info() {
   ip6tables $IPTABLES_FLAGS --numeric --verbose --list --table mangle > $TMPDIR/networking/ip6tablesmangle 2>&1
   ip6tables $IPTABLES_FLAGS --numeric --verbose --list --table nat > $TMPDIR/networking/ip6tablesnat 2>&1
   ip6tables $IPTABLES_FLAGS --numeric --verbose --list > $TMPDIR/networking/ip6tables 2>&1
-  if $(command -v nft >/dev/null 2>&1); then
+  if command -v nft >/dev/null 2>&1; then
     nft list ruleset  > $TMPDIR/networking/nft_ruleset 2>&1
   fi
-  if $(command -v netstat >/dev/null 2>&1); then
+  if command -v netstat >/dev/null 2>&1; then
     netstat --programs --all --numeric --tcp --udp > $TMPDIR/networking/netstat 2>&1
     netstat --statistics > $TMPDIR/networking/netstatistics 2>&1
   fi
-  if $(command -v ipvsadm >/dev/null 2>&1); then
+  if command -v ipvsadm >/dev/null 2>&1; then
     ipvsadm -ln > $TMPDIR/networking/ipvsadm 2>&1
   fi
   if [ -f /proc/net/xfrm_stat ]
     then
       cat /proc/net/xfrm_stat > $TMPDIR/networking/procnetxfrmstat 2>&1
   fi
-  if $(command -v ip >/dev/null 2>&1); then
+  if command -v ip >/dev/null 2>&1; then
     ip addr show > $TMPDIR/networking/ipaddrshow 2>&1
     ip route show table all > $TMPDIR/networking/iproute 2>&1
     ip neighbour > $TMPDIR/networking/ipneighbour 2>&1
@@ -820,10 +886,10 @@ function networking-info() {
     ip -6 route show > $TMPDIR/networking/ipv6route 2>&1
     ip -6 addr show > $TMPDIR/networking/ipv6addrshow 2>&1
   fi
-  if $(command -v ifconfig >/dev/null 2>&1); then
+  if command -v ifconfig >/dev/null 2>&1; then
     ifconfig -a > $TMPDIR/networking/ifconfiga
   fi
-  if $(command -v ss >/dev/null 2>&1); then
+  if command -v ss >/dev/null 2>&1; then
     ss -anp > $TMPDIR/networking/ssanp 2>&1
     ss -itan > $TMPDIR/networking/ssitan 2>&1
     ss -uapn > $TMPDIR/networking/ssuapn 2>&1
@@ -987,6 +1053,7 @@ if [ "${DISTRO}" = "canonical" ]; then
   canonical-k8s-snap-info
 fi
 
+mongo-status
 helm-logs
 archive
 cleanup
