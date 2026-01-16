@@ -143,6 +143,14 @@ Output that is collected from the cluster. Note that some information can only b
   * System services
   * Monitoring and logging components
 
+### MongoDB Collection (Enterprise Clusters Only)
+
+For Enterprise and PCG clusters, the script collects MongoDB replica set information:
+
+* `rs-status.json`: Replica set status including member health, sync state, and election info
+* `rs-conf.json`: Replica set configuration including member settings and priorities
+* `replication-info.txt`: Oplog information and replication window
+
 ## Important Notes
 
 * The script requires proper kubectl access to the cluster
