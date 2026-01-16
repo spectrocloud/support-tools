@@ -518,7 +518,7 @@ function mongo-status() {
     if kubectl exec -n hubble-system $POD -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'rs.status()'" >/dev/null 2>&1; then
       MONGO_POD=$POD
       techo "Using MongoDB pod: $MONGO_POD (replica set member)"
-      # break
+      break
     else
       techo "Pod $POD is not a replica set member, trying next..."
     fi
