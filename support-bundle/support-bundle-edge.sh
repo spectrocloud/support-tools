@@ -503,7 +503,7 @@ function mongo-status() {
     MONGO_AUTH='-u $MONGODB_INITDB_ROOT_USERNAME -p $MONGODB_INITDB_ROOT_PASSWORD --host $HOSTNAME --tls --tlsCAFile /var/mongodb/tls/ca.crt --tlsCertificateKeyFile /var/mongodb/tls/tls-combined.pem --tlsAllowInvalidHostnames'
   else
     techo "Detected standard EC cluster"
-    DB_PASSWORD=$(kubectl get secrets configserversecret -o jsonpath="{.data.dbPassword}" -n hubble-system 2>/dev/null | base64 -d 2>/dev/null)
+    DB_PASSWORD=$(kubectl get secret spectromongosecret -o jsonpath="{.data.mongoRootPassword}" -n hubble-system 2>/dev/null | base64 -d 2>/dev/null)
     if [[ -z "$DB_PASSWORD" ]]; then
       echo "Failed to retrieve MongoDB password" > "${TMPDIR}/mongo/status.txt"
       return
