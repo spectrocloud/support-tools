@@ -490,7 +490,7 @@ function mongo-status() {
   FIRST_POD=$(echo "$MONGO_PODS" | head -1)
 
   # Try mongosh first, fall back to mongo for older versions
-  if kubectl exec -n hubble-system $FIRST_POD -c mongo -- which mongosh >/dev/null 2>&1; then
+  if kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongosh >/dev/null 2>&1; then
     MONGO_CMD="mongosh"
   else
     MONGO_CMD="mongo"
@@ -498,7 +498,7 @@ function mongo-status() {
   techo "Using MongoDB shell: $MONGO_CMD"
 
   # Check if TLS is enabled (VerteX EC cluster)
-  if kubectl exec -n hubble-system $FIRST_POD -c mongo -- test -f /var/mongodb/tls/ca.crt 2>/dev/null; then
+  if kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- test -f /var/mongodb/tls/ca.crt 2>/dev/null; then
     techo "Detected VerteX EC cluster (TLS enabled)"
     MONGO_AUTH='-u $MONGODB_INITDB_ROOT_USERNAME -p $MONGODB_INITDB_ROOT_PASSWORD --host $HOSTNAME --tls --tlsCAFile /var/mongodb/tls/ca.crt --tlsCertificateKeyFile /var/mongodb/tls/tls-combined.pem --tlsAllowInvalidHostnames'
   else
@@ -515,13 +515,12 @@ function mongo-status() {
   MONGO_POD=""
   for POD in $MONGO_PODS; do
     techo "Trying MongoDB pod: $POD"
-    if kubectl exec -n hubble-system $POD -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'rs.status()'" >/dev/null 2>&1; then
-      MONGO_POD=$POD
+    if kubectl exec -n hubble-system "$POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'rs.status()'" >/dev/null 2>&1; then
+      MONGO_POD="$POD"
       techo "Using MongoDB pod: $MONGO_POD (replica set member)"
       break
-    else
-      techo "Pod $POD is not a replica set member, trying next..."
     fi
+    techo "Pod $POD is not a replica set member, trying next..."
   done
 
   if [[ -z "$MONGO_POD" ]]; then
@@ -530,13 +529,13 @@ function mongo-status() {
   fi
 
   techo "Collecting MongoDB replica set status"
-  kubectl exec -n hubble-system $MONGO_POD -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'JSON.stringify(rs.status())'" > "${TMPDIR}/mongo/rs-status.json" 2>&1
+  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'JSON.stringify(rs.status(), null, 2)'" > "${TMPDIR}/mongo/rs-status.json" 2>&1
 
   techo "Collecting MongoDB replica set configuration"
-  kubectl exec -n hubble-system $MONGO_POD -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'JSON.stringify(rs.conf())'" > "${TMPDIR}/mongo/rs-conf.json" 2>&1
+  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'JSON.stringify(rs.conf(), null, 2)'" > "${TMPDIR}/mongo/rs-conf.json" 2>&1
 
   techo "Collecting MongoDB replication info"
-  kubectl exec -n hubble-system $MONGO_POD -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'rs.printReplicationInfo()'" > "${TMPDIR}/mongo/replication-info.txt" 2>&1
+  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'rs.printReplicationInfo()'" > "${TMPDIR}/mongo/replication-info.txt" 2>&1
 }
 
 function k8s-resources() {
