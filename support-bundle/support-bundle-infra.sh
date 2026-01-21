@@ -285,18 +285,25 @@ function setup() {
   TMPDIR="${TMPDIR_BASE}/${LOGNAME}"
   mkdir -p "$TMPDIR" || { techo "Failed to create temporary log directory $TMPLOG_DIR"; exit 1; }
   
+  # Save original file descriptors before redirecting
+  exec 3>&1 4>&2
   exec > >(tee -a "$TMPDIR/console.log") 2>&1
   techo "Collecting logs in $TMPDIR"
   techo "Support Bundle Version: $SB_VERSION" > "$TMPDIR/.support-bundle"
 }
 
 function archive() {
+  techo "Creating archive ${LOGNAME}.tar.gz"
+  techo "Please upload the support bundle to the support ticket"
+  
+  # Restore original fds to close tee pipe and flush console.log
+  exec 1>&3 2>&4
+  
   tar -czf "${LOGNAME}.tar.gz" -C "$TMPDIR_BASE" "$LOGNAME" || {
     techo "Failed to create tar file"
   }
 
   techo "Logs are archived in ${LOGNAME}.tar.gz"
-  techo "Please upload the support bundle to the support ticket"
 }
 
 function cleanup() {
