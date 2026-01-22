@@ -496,11 +496,15 @@ function mongo-status() {
   # Use first pod to detect mongo shell and auth method
   FIRST_POD=$(echo "$MONGO_PODS" | head -1)
 
-  # Try mongosh first, fall back to mongo for older versions
+  # Try mongosh first, fall back to mongo for older versions (use full path)
   if kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongosh >/dev/null 2>&1; then
-    MONGO_CMD="mongosh"
+    MONGO_CMD=$(kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongosh 2>/dev/null)
+  elif kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongo >/dev/null 2>&1; then
+    MONGO_CMD=$(kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongo 2>/dev/null)
   else
-    MONGO_CMD="mongo"
+    techo "Neither mongosh nor mongo command found in pod"
+    echo "Neither mongosh nor mongo command found in pod" > "${TMPDIR}/mongo/status.txt"
+    return
   fi
   techo "Using MongoDB shell: $MONGO_CMD"
 
