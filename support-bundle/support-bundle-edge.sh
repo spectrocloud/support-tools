@@ -72,6 +72,8 @@ function setup() {
   TMPDIR="${TMPDIR_BASE}/${LOGNAME}"
   mkdir -p "$TMPDIR" || { echo "Failed to create temporary log directory $TMPLOG_DIR"; exit 1; }
 
+  # Save original file descriptors before redirecting
+  exec 3>&1 4>&2
   exec > >(tee -a "$TMPDIR/console.log") 2>&1
   techo "Collecting logs in $TMPDIR"
   techo "Support Bundle Version: $SB_VERSION" > "$TMPDIR/.support-bundle"
@@ -107,12 +109,17 @@ function defaults() {
 }
 
 function archive() {
+  techo "Creating archive ${LOGNAME}.tar.gz"
+  techo "Please upload the support bundle to the support ticket"
+  
+  # Restore original fds to close tee pipe and flush console.log
+  exec 1>&3 2>&4
+  
   tar -czf "${TMPDIR_BASE}/${LOGNAME}.tar.gz" -C "$TMPDIR_BASE" "$LOGNAME" || {
     techo "Failed to create tar file"
   }
 
   techo "Logs are archived in ${TMPDIR_BASE}/${LOGNAME}.tar.gz"
-  techo "Please upload the support bundle to the support ticket"
 }
 
 function cleanup() {
@@ -489,11 +496,15 @@ function mongo-status() {
   # Use first pod to detect mongo shell and auth method
   FIRST_POD=$(echo "$MONGO_PODS" | head -1)
 
-  # Try mongosh first, fall back to mongo for older versions
+  # Try mongosh first, fall back to mongo for older versions (use full path)
   if kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongosh >/dev/null 2>&1; then
-    MONGO_CMD="mongosh"
+    MONGO_CMD=$(kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongosh 2>/dev/null)
+  elif kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongo >/dev/null 2>&1; then
+    MONGO_CMD=$(kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongo 2>/dev/null)
   else
-    MONGO_CMD="mongo"
+    techo "Neither mongosh nor mongo command found in pod"
+    echo "Neither mongosh nor mongo command found in pod" > "${TMPDIR}/mongo/status.txt"
+    return
   fi
   techo "Using MongoDB shell: $MONGO_CMD"
 
