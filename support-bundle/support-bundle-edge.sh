@@ -219,6 +219,18 @@ function var-log() {
       cp -p "$logfile" "$TMPDIR/var/log" 2>&1
     fi
   done
+
+  # Collect SpectroCloud logs written by system tasks (e.g. cert renewal)
+  if [ -d /var/log/spectrocloud ]; then
+    techo "Collecting logs from /var/log/spectrocloud"
+    mkdir -p "$TMPDIR/var/log/spectrocloud"
+    ls -lah /var/log/spectrocloud/ > "$TMPDIR/var/log/spectrocloud/files" 2>&1
+    for logfile in /var/log/spectrocloud/*; do
+      if [ -f "$logfile" ] && file "$logfile" | grep -q "text"; then
+        cp -p "$logfile" "$TMPDIR/var/log/spectrocloud" 2>&1
+      fi
+    done
+  fi
 }
 
 function journald-log() {
