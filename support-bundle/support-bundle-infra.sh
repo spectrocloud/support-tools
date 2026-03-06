@@ -67,18 +67,23 @@ function spectro-k8s-defaults() {
     fi
   done
 
-  CLUSTER_NS=$(kubectl get ns --output=custom-columns="Name:.metadata.name" --no-headers -l 'spectrocloud.com/cluster-name' 2>/dev/null)
-  if [[ -z "${CLUSTER_NS}" ]]; then
-    CLUSTER_NS=$(kubectl get ns -o=name | grep '^namespace/cluster-' | sed "s/^.\{10\}//")
+  CLUSTER_NSS=$(kubectl get ns --output=custom-columns="Name:.metadata.name" --no-headers -l 'spectrocloud.com/cluster-name' 2>/dev/null)
+  if [[ -z "${CLUSTER_NSS}" ]]; then
+    CLUSTER_NSS=$(kubectl get ns -o=name | grep '^namespace/cluster-' | sed "s/^.\{10\}//")
   fi
 
-  if [[ -z "${CLUSTER_NS}" ]]; then
+  if [[ -z "${CLUSTER_NSS}" ]]; then
     techo "Palette cluster namespace is empty."
   else
-    for NS in $(echo $CLUSTER_NS | tr " " "\n"); do
+    for NS in $(echo $CLUSTER_NSS | tr " " "\n"); do
       techo "Adding namespace $NS for logs collection."
       SYSTEM_NAMESPACES+=("$NS")
-    done
+
+      if [[ "$NS" =~ [0-9a-fA-F\-]{8,} ]]; then
+        CLUSTER_NS="$NS"
+        techo "Cluster namespace: $CLUSTER_NS"
+      fi
+    done 
   fi
 
   SYSTEM_UPGRADE_UUID_NS=$(kubectl get ns -o=name | grep '^namespace/system-upgrade-' | sed "s/^.\{10\}//")
