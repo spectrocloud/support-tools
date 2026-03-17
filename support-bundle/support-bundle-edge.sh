@@ -43,6 +43,10 @@ API_RESOURCES=(apiservices clusterroles clusterrolebindings crds csr mutatingweb
 API_RESOURCES_NAMESPACED=(apiservices configmaps cronjobs daemonsets deployments endpoints endpointslices events hpa ingress jobs leases limitranges networkpolicies poddisruptionbudgets pods pvc replicasets resourcequotas roles rolebindings services serviceaccounts statefulsets)
 
 VAR_LOG_LINES=500000
+COLLECT_AUDIT_LOGS=false
+AUDIT_LOG_DAYS=3
+AUDIT_START_TIME=""
+AUDIT_END_TIME=""
 
 function load-env() {
   if [ -f /etc/spectro/environment ]; then
@@ -153,7 +157,7 @@ function sherlock() {
     techo "Could not detect K8s distribution."
   fi
 
-  if [ -z ${DISTRO} ]; then
+  if [ -z "${DISTRO}" ]; then
     if [ -n "${FOUND}" ]; then
       techo "Could not detect K8s distribution. Found ${FOUND}"
     else
@@ -872,6 +876,522 @@ function crictl-logs() {
   fi
 }
 
+function normalize_time_utc() {
+  local input="$1"
+  local normalized=""
+
+  [ -n "$input" ] || return 1
+
+  case "$input" in
+    *Z)
+      normalized="$(date -u -d "$input" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)" || return 1
+      ;;
+    *T*|*" "*)
+      normalized="$(date -u -d "$input" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)" || return 1
+      ;;
+    *)
+      normalized="$(date -u -d "$input 00:00:00" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)" || return 1
+      ;;
+  esac
+
+  printf '%s\n' "$normalized"
+}
+
+function normalize_end_time_utc() {
+  local input="$1"
+  local normalized=""
+
+  [ -n "$input" ] || return 1
+
+  case "$input" in
+    *Z)
+      normalized="$(date -u -d "$input" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)" || return 1
+      ;;
+    *T*|*" "*)
+      normalized="$(date -u -d "$input" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)" || return 1
+      ;;
+    *)
+      normalized="$(date -u -d "$input 23:59:59" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)" || return 1
+      ;;
+  esac
+
+  printf '%s\n' "$normalized"
+}
+
+function copy_if_exists() {
+  local src="$1"
+  local dst="$2"
+
+  [ -f "$src" ] || return 0
+  cp -p "$src" "$dst/" 2>/dev/null || true
+}
+
+function collect_audit_files_from_dir() {
+  local src_dir="$1"
+  local dst_dir="$2"
+  local found=1
+  local f=""
+  local listing_name=""
+
+  [ -d "$src_dir" ] || return 1
+
+  techo "Scanning audit directory: $src_dir"
+  listing_name="$(printf '%s' "$src_dir" | sed 's#/#_#g; s/^_//')-listing.txt"
+  ls -lah "$src_dir" > "${dst_dir}/${listing_name}" 2>&1 || true
+
+  for f in \
+    "$src_dir"/audit.log \
+    "$src_dir"/audit.log.* \
+    "$src_dir"/audit-*.log \
+    "$src_dir"/*audit*.log \
+    "$src_dir"/*audit*.json \
+    "$src_dir"/*audit*.gz
+  do
+    [ -e "$f" ] || continue
+    [ -f "$f" ] || continue
+    found=0
+    cp -p "$f" "$dst_dir/" 2>/dev/null || true
+  done
+
+  return "$found"
+}
+
+function collect_audit_candidate_files_from_dir() {
+  local src_dir="$1"
+  local dst_dir="$2"
+  local start_time="$3"
+  local end_time="$4"
+
+  local found=1
+  local listing_name=""
+  local current_log=""
+  local prev_file=""
+  local file=""
+  local base=""
+  local ts=""
+  local file_epoch=""
+  local start_epoch=""
+  local end_epoch=""
+
+  [ -d "$src_dir" ] || return 1
+
+  start_epoch="$(date -u -d "$start_time" +%s 2>/dev/null)" || return 1
+  end_epoch="$(date -u -d "$end_time" +%s 2>/dev/null)" || return 1
+
+  techo "Scanning audit directory with candidate preselection: $src_dir"
+  listing_name="$(echo "$src_dir" | sed 's#/#_#g' | sed 's/^_//')-listing.txt"
+  ls -lah "$src_dir" > "${dst_dir}/${listing_name}" 2>&1 || true
+
+  current_log="$src_dir/audit.log"
+  if [ -f "$current_log" ]; then
+    cp -p "$current_log" "$dst_dir/" 2>/dev/null || true
+    found=0
+  fi
+
+  prev_file=""
+
+  while IFS= read -r file; do
+    [ -f "$file" ] || continue
+    base="$(basename "$file")"
+    ts=""
+
+    case "$base" in
+      audit-*.log)
+        ts="$(echo "$base" | sed -E 's/^audit-([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})\..*\.log$/\1 \2:\3:\4/')"
+        ;;
+      audit-*.log.gz)
+        ts="$(echo "$base" | sed -E 's/^audit-([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})\..*\.log\.gz$/\1 \2:\3:\4/')"
+        ;;
+      *)
+        ts=""
+        ;;
+    esac
+
+    [ -n "$ts" ] || continue
+
+    file_epoch="$(date -u -d "$ts" +%s 2>/dev/null)" || file_epoch=""
+    [ -n "$file_epoch" ] || continue
+
+    if [ "$file_epoch" -ge "$start_epoch" ] && [ "$file_epoch" -le "$end_epoch" ]; then
+      cp -p "$file" "$dst_dir/" 2>/dev/null || true
+      found=0
+    elif [ "$file_epoch" -lt "$start_epoch" ]; then
+      prev_file="$file"
+    fi
+  done < <(
+    find "$src_dir" -maxdepth 1 -type f \
+      \( -name 'audit-*.log' -o -name 'audit-*.log.gz' \) | sort
+  )
+
+  if [ -n "$prev_file" ] && [ -f "$prev_file" ]; then
+    cp -p "$prev_file" "$dst_dir/" 2>/dev/null || true
+    found=0
+  fi
+
+  # Fallback: copy only a small number of recent rotated audit.log files
+  while IFS= read -r file; do
+    [ -f "$file" ] || continue
+    cp -p "$file" "$dst_dir/" 2>/dev/null || true
+    found=0
+  done < <(
+    find "$src_dir" -maxdepth 1 -type f -name 'audit.log.*' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr \
+    | head -n 2 \
+    | cut -d' ' -f2-
+  )
+
+  return "$found"
+}
+
+function compress_audit_raw_logs() {
+  local raw_dir="$1"
+  local f=""
+
+  if ! command -v gzip >/dev/null 2>&1; then
+    techo "gzip not found; skipping raw audit log compression"
+    return 0
+  fi
+
+  for f in "$raw_dir"/*.log; do
+    [ -e "$f" ] || continue
+    [ -f "$f" ] || continue
+    gzip -f "$f" 2>/dev/null || true
+  done
+}
+
+function filter_audit_files_by_timerange() {
+  local raw_dir="$1"
+  local dst_file="$2"
+  local start_time="$3"
+  local end_time="$4"
+  local tmp_merged=""
+  local f=""
+
+  tmp_merged="${raw_dir}/.audit-merged.jsonl"
+  : > "$tmp_merged"
+
+  for f in "$raw_dir"/*; do
+    [ -f "$f" ] || continue
+    case "$f" in
+      *.gz)
+        zcat -f "$f" >> "$tmp_merged" 2>/dev/null || true
+        ;;
+      *.log|*.json)
+        cat "$f" >> "$tmp_merged" 2>/dev/null || true
+        ;;
+    esac
+  done
+
+  if [ ! -s "$tmp_merged" ]; then
+    techo "No audit content available for time filtering"
+    rm -f "$tmp_merged" 2>/dev/null || true
+    return 1
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -c --arg start "$start_time" --arg end "$end_time" '
+      select(
+        (
+          .requestReceivedTimestamp != null and
+          .requestReceivedTimestamp >= $start and
+          .requestReceivedTimestamp <= $end
+        ) or (
+          .stageTimestamp != null and
+          .stageTimestamp >= $start and
+          .stageTimestamp <= $end
+        )
+      )
+    ' "$tmp_merged" > "$dst_file" 2>/dev/null || true
+
+    if [ -s "$dst_file" ]; then
+      techo "Created filtered audit log: $dst_file"
+    else
+      techo "Filtered audit log is empty for requested range"
+    fi
+  else
+    techo "jq not found; exact audit time filtering skipped. Raw audit files were still collected."
+    {
+      echo "jq not found; exact audit time-range filtering skipped."
+      echo "Requested range: $start_time to $end_time"
+    } > "$dst_file"
+  fi
+
+  rm -f "$tmp_merged" 2>/dev/null || true
+}
+
+function to_epoch_utc() {
+  local input="$1"
+  local epoch=""
+
+  [ -n "$input" ] || return 1
+  epoch="$(date -u -d "$input" +%s 2>/dev/null)" || return 1
+  printf '%s\n' "$epoch"
+}
+
+function audit_coverage_report() {
+  local raw_dir="$1"
+  local report_dir="$2"
+  local requested_start="$3"
+  local requested_end="$4"
+  local report_file="${report_dir}/audit-coverage-report.txt"
+  local tmp_merged="${raw_dir}/.audit-coverage-merged.jsonl"
+  local earliest=""
+  local latest=""
+  local f=""
+
+  local req_start_epoch=""
+  local req_end_epoch=""
+  local earliest_epoch=""
+  local latest_epoch=""
+
+  {
+    echo "Requested audit range:"
+    echo "  start: ${requested_start}"
+    echo "  end:   ${requested_end}"
+    echo
+  } > "$report_file"
+
+  : > "$tmp_merged"
+
+  for f in "$raw_dir"/*; do
+    [ -f "$f" ] || continue
+    case "$f" in
+      *.gz)
+        zcat -f "$f" >> "$tmp_merged" 2>/dev/null || true
+        ;;
+      *.log|*.json)
+        cat "$f" >> "$tmp_merged" 2>/dev/null || true
+        ;;
+    esac
+  done
+
+  if [ ! -s "$tmp_merged" ]; then
+    {
+      echo "No audit log content was collected."
+      echo "This may mean audit logs are not present on disk or were already rotated out."
+    } >> "$report_file"
+    rm -f "$tmp_merged" 2>/dev/null || true
+    return 0
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    earliest="$(jq -r '
+      [.requestReceivedTimestamp, .stageTimestamp]
+      | map(select(. != null))
+      | .[]
+    ' "$tmp_merged" 2>/dev/null | sort | head -n 1)"
+
+    latest="$(jq -r '
+      [.requestReceivedTimestamp, .stageTimestamp]
+      | map(select(. != null))
+      | .[]
+    ' "$tmp_merged" 2>/dev/null | sort | tail -n 1)"
+
+    {
+      echo "Available audit event range found in collected files:"
+      echo "  earliest: ${earliest:-unknown}"
+      echo "  latest:   ${latest:-unknown}"
+      echo
+    } >> "$report_file"
+
+    if [ -n "$earliest" ] && [ -n "$latest" ]; then
+      req_start_epoch="$(to_epoch_utc "$requested_start")" || req_start_epoch=""
+      req_end_epoch="$(to_epoch_utc "$requested_end")" || req_end_epoch=""
+      earliest_epoch="$(to_epoch_utc "$earliest")" || earliest_epoch=""
+      latest_epoch="$(to_epoch_utc "$latest")" || latest_epoch=""
+
+      if [ -n "$req_start_epoch" ] && [ -n "$req_end_epoch" ] && [ -n "$earliest_epoch" ] && [ -n "$latest_epoch" ]; then
+        if [ "$req_end_epoch" -lt "$earliest_epoch" ] || [ "$req_start_epoch" -gt "$latest_epoch" ]; then
+          {
+            echo "Coverage result: NO OVERLAP"
+            echo "Requested time range is outside the available audit logs on disk."
+            echo "Older logs may have been rotated out, or newer logs may not exist yet."
+          } >> "$report_file"
+        elif [ "$req_start_epoch" -ge "$earliest_epoch" ] && [ "$req_end_epoch" -le "$latest_epoch" ]; then
+          {
+            echo "Coverage result: FULL COVERAGE"
+            echo "Requested time range falls within the available audit logs on disk."
+          } >> "$report_file"
+        else
+          {
+            echo "Coverage result: PARTIAL COVERAGE"
+            echo "Only part of the requested time range is available in collected audit logs."
+            echo "This commonly happens when older logs have been rotated out due to retention or rotation policy."
+          } >> "$report_file"
+        fi
+      else
+        {
+          echo "Coverage result: UNKNOWN"
+          echo "Could not convert one or more timestamps to epoch values."
+        } >> "$report_file"
+      fi
+    else
+      {
+        echo "Coverage result: UNKNOWN"
+        echo "Could not determine earliest/latest audit event timestamps from collected files."
+      } >> "$report_file"
+    fi
+  else
+    {
+      echo "Coverage result: UNKNOWN"
+      echo "jq is not installed, so exact audit event timestamp coverage could not be calculated."
+      echo "Raw audit files were still collected."
+    } >> "$report_file"
+  fi
+
+  rm -f "$tmp_merged" 2>/dev/null || true
+}
+
+function collect_k8s_audit_logs() {
+  local audit_dir="${TMPDIR}/k8s/audit-logs"
+  local raw_dir="${audit_dir}/raw"
+  local start_time=""
+  local end_time=""
+  local found_any=1
+  local dir=""
+  local policy_path=""
+  local explicit_range=false
+  local raw_size_mb=""
+
+  techo "Collecting Kubernetes audit logs..."
+  mkdir -p "$audit_dir" "$raw_dir"
+
+  if [ -n "$AUDIT_START_TIME" ]; then
+    start_time="$(normalize_time_utc "$AUDIT_START_TIME")" || {
+      techo "Invalid audit start time: $AUDIT_START_TIME"
+      echo "Invalid audit start time: $AUDIT_START_TIME" > "${audit_dir}/status.txt"
+      return 1
+    }
+    explicit_range=true
+  else
+    start_time="$(date -u -d "${AUDIT_LOG_DAYS} days ago" +"%Y-%m-%dT%H:%M:%SZ")"
+  fi
+
+  if [ -n "$AUDIT_END_TIME" ]; then
+    end_time="$(normalize_end_time_utc "$AUDIT_END_TIME")" || {
+      techo "Invalid audit end time: $AUDIT_END_TIME"
+      echo "Invalid audit end time: $AUDIT_END_TIME" > "${audit_dir}/status.txt"
+      return 1
+    }
+    explicit_range=true
+  else
+    end_time="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  fi
+
+  if [[ "$start_time" > "$end_time" ]]; then
+    techo "Audit start time must be earlier than or equal to audit end time"
+    echo "Audit start time must be earlier than or equal to audit end time" > "${audit_dir}/status.txt"
+    return 1
+  fi
+
+  techo "Audit log requested range: ${start_time} to ${end_time}"
+  {
+    echo "audit_start_time=${start_time}"
+    echo "audit_end_time=${end_time}"
+    echo "audit_log_days=${AUDIT_LOG_DAYS}"
+    echo "explicit_range=${explicit_range}"
+  } > "${audit_dir}/audit-range.txt"
+
+  AUDIT_LOG_DIRS=(
+    "/var/log/apiserver"
+    "/var/log/kubernetes/audit"
+    "/var/log/kube-apiserver"
+    "/var/lib/rancher/rke2/server/logs"
+    "/var/lib/rancher/k3s/server/logs"
+  )
+
+  for dir in "${AUDIT_LOG_DIRS[@]}"; do
+    if [ "$explicit_range" = true ]; then
+      if collect_audit_candidate_files_from_dir "$dir" "$raw_dir" "$start_time" "$end_time"; then
+        found_any=0
+      fi
+    else
+      if collect_audit_files_from_dir "$dir" "$raw_dir"; then
+        found_any=0
+      fi
+    fi
+  done
+
+  copy_if_exists "/var/log/apiserver/audit.log" "$raw_dir"
+  copy_if_exists "/var/log/kubernetes/audit/audit.log" "$raw_dir"
+  copy_if_exists "/var/log/kube-apiserver/audit.log" "$raw_dir"
+
+  ls -lah "$raw_dir" > "${audit_dir}/collected-files-before-compression.txt" 2>&1 || true
+  compress_audit_raw_logs "$raw_dir"
+  ls -lah "$raw_dir" > "${audit_dir}/collected-files.txt" 2>&1 || true
+
+  if command -v du >/dev/null 2>&1; then
+    raw_size_mb="$(du -sm "$raw_dir" 2>/dev/null | awk '{print $1}')"
+    if [ -n "$raw_size_mb" ]; then
+      echo "compressed_raw_size_mb=${raw_size_mb}" >> "${audit_dir}/audit-range.txt"
+      if [ "$raw_size_mb" -gt 500 ]; then
+        techo "WARNING: Compressed raw audit logs size is ${raw_size_mb}MB"
+      fi
+    fi
+  fi
+
+  filter_audit_files_by_timerange "$raw_dir" "${audit_dir}/audit-filtered.jsonl" "$start_time" "$end_time" || true
+  audit_coverage_report "$raw_dir" "$audit_dir" "$start_time" "$end_time"
+
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl -u kube-apiserver --since "$start_time" --until "$end_time" --no-pager \
+      > "${audit_dir}/kube-apiserver-journal.log" 2>&1 || true
+  fi
+
+  if [ -f "/etc/kubernetes/manifests/kube-apiserver.yaml" ]; then
+    grep -A 20 -B 5 "audit" /etc/kubernetes/manifests/kube-apiserver.yaml \
+      > "${audit_dir}/apiserver-audit-config.txt" 2>/dev/null || true
+  fi
+
+  AUDIT_POLICY_PATHS=(
+    "/etc/kubernetes/audit-policy.yaml"
+    "/etc/rancher/rke2/audit-policy.yaml"
+    "/etc/rancher/k3s/audit-policy.yaml"
+  )
+
+  for policy_path in "${AUDIT_POLICY_PATHS[@]}"; do
+    if [ -f "$policy_path" ]; then
+      cp -p "$policy_path" "$audit_dir/" 2>/dev/null || true
+    fi
+  done
+
+  if [ "$found_any" -ne 0 ]; then
+    techo "No audit log files found in known locations"
+    echo "No audit log files found in known locations" > "${audit_dir}/status.txt"
+  else
+    techo "Kubernetes audit log collection completed"
+  fi
+}
+
+function collect_audit_diagnostics() {
+  local audit_dir="${TMPDIR}/k8s/audit-logs"
+
+  techo "Collecting audit diagnostics..."
+  mkdir -p "$audit_dir"
+
+  if kubectl version >/dev/null 2>&1; then
+    kubectl get pod -n kube-system -l component=kube-apiserver -o yaml \
+      > "${audit_dir}/kube-apiserver-pod.yaml" 2>/dev/null || true
+  fi
+
+  ps aux | grep -E "[k]ube-apiserver|audit" \
+    > "${audit_dir}/audit-processes.txt" 2>/dev/null || true
+
+  if [ -f "/etc/rancher/rke2/config.yaml" ]; then
+    grep -A 20 -B 5 "audit" /etc/rancher/rke2/config.yaml \
+      > "${audit_dir}/rke2-audit-config.txt" 2>/dev/null || true
+  fi
+
+  if [ -f "/etc/systemd/system/k3s.service" ]; then
+    grep -A 20 -B 5 "audit" /etc/systemd/system/k3s.service \
+      > "${audit_dir}/k3s-audit-config.txt" 2>/dev/null || true
+  fi
+
+  if [ -f "/etc/systemd/system/k3s.service.env" ]; then
+    grep -A 20 -B 5 "audit" /etc/systemd/system/k3s.service.env \
+      > "${audit_dir}/k3s-audit-env-config.txt" 2>/dev/null || true
+  fi
+}
 function networking-info() {
   techo "Collecting network info"
   mkdir -p $TMPDIR/networking
@@ -943,8 +1463,8 @@ function help() {
   -d    Output directory for temporary storage and .tar.gz archive (ex: -d /var/tmp)
   -s    Start day of journald log collection. Specify the number of days before the current time (ex: -s 7)
   -e    End day of journald log collection. Specify the number of days before the current time (ex: -e 5)
-  -S    Start date of journald log collection. (ex: -S 2024-01-01)
-  -E    End date of journald log collection. (ex: -E 2024-01-01)
+  -S    Start date/time of journald log collection. (ex: -S 2024-01-01 or -S \"2024-01-01 10:00:00\")
+  -E    End date/time of journald log collection. (ex: -E 2024-01-01 or -E \"2024-01-01 18:00:00\")
   -l    Number of log lines to collect from journald logs. (ex: -l 500000)
   -j    Additional journald logs to collect. (ex: -j cloud-init,cloud-init-local)
 
@@ -952,6 +1472,12 @@ function help() {
   -n    Additional namespaces to collect logs from. (ex: -n hello-universe,hello-world)
   -r    Additional namespace scoped resources to collect. (ex: -r certificates.cert-manager.io,clusterissuers.cert-manager.io)
   -R    Additional cluster scoped resources to collect. (ex: -R clusterissuers.cert-manager.io,clusterissuers.cert-manager.io)
+
+  # audit log flags
+  -u    Enable Kubernetes audit log collection
+  -f    Audit log start date/time. (ex: -f 2026-03-15 or -f \"2026-03-15 10:00:00\")
+  -t    Audit log end date/time. (ex: -t 2026-03-16 or -t \"2026-03-16 23:59:59\")
+  -w    Audit log lookback in days when -f is not set. Default: 3 (ex: -w 7)
 
   "
 }
@@ -964,7 +1490,7 @@ if [[ $EUID -ne 0 ]] && [[ "${DEV}" == "" ]]
     exit 1
 fi
 
-while getopts "d:s:e:S:E:l:n:r:R:j:h" opt; do
+while getopts "d:s:e:S:E:l:n:r:R:j:uf:t:w:h" opt; do
   case $opt in
   d)
     MKTEMP_BASEDIR="-p ${OPTARG}"
@@ -1028,6 +1554,29 @@ while getopts "d:s:e:S:E:l:n:r:R:j:h" opt; do
       JOURNALD_LOGS+=("$RESOURCE")
     done
     ;;
+  u)
+    COLLECT_AUDIT_LOGS=true
+    techo "Kubernetes audit log collection enabled"
+    ;;
+  f)
+    COLLECT_AUDIT_LOGS=true
+    AUDIT_START_TIME="${OPTARG}"
+    techo "Collecting audit logs starting ${AUDIT_START_TIME}"
+    ;;
+  t)
+    COLLECT_AUDIT_LOGS=true
+    AUDIT_END_TIME="${OPTARG}"
+    techo "Collecting audit logs until ${AUDIT_END_TIME}"
+    ;;
+  w)
+    if ! [[ "${OPTARG}" =~ ^[0-9]+$ ]]; then
+      techo "Invalid audit log lookback days: ${OPTARG}"
+      exit 1
+    fi
+    COLLECT_AUDIT_LOGS=true
+    AUDIT_LOG_DAYS="${OPTARG}"
+    techo "Collecting audit logs for the last ${AUDIT_LOG_DAYS} days when explicit start time is not set"
+    ;;
   h)
     help && exit 0
     ;;
@@ -1052,6 +1601,13 @@ crictl-logs
 set-kubeconfig
 spectro-k8s-defaults
 k8s-resources
+if [[ "${COLLECT_AUDIT_LOGS}" == true ]]; then
+  techo "Audit collection flag enabled. Collecting audit-related logs and diagnostics"
+  collect_k8s_audit_logs
+  collect_audit_diagnostics
+else
+  techo "Skipping Kubernetes audit-related collection"
+fi
 if [ "${DISTRO}" = "kubeadm" ]; then
   var-log-pods
   opt-kubeadm-files
