@@ -183,6 +183,77 @@ function mongo-status() {
   kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'rs.printReplicationInfo()'" > "${TMPDIR}/mongo/replication-info.txt" 2>&1
 }
 
+function etcd-status() {
+  if ! command -v kubectl >/dev/null 2>&1; then
+    techo "etcd-status: kubectl command not found"
+    return
+  fi
+
+  techo "Collecting etcd status"
+  mkdir -p "${TMPDIR}/etcd"
+
+  # Primary: label-based (kubeadm, RKE2 with label)
+  ETCD_PODS=$(kubectl get pods -n kube-system -l component=etcd --field-selector=status.phase=Running \
+    -o custom-columns="NAME:.metadata.name" --no-headers 2>/dev/null)
+
+  # Fallback: name-based for RKE2/k3s where the label may be absent
+  if [[ -z "$ETCD_PODS" ]]; then
+    ETCD_PODS=$(kubectl get pods -n kube-system --field-selector=status.phase=Running \
+      -o custom-columns="NAME:.metadata.name" --no-headers 2>/dev/null | grep '^etcd-')
+  fi
+
+  if [[ -z "$ETCD_PODS" ]]; then
+    # k3s defaults to SQLite — no etcd pods is expected in that case
+    techo "No running etcd pods found in kube-system namespace (cluster may be using SQLite)"
+    echo "No running etcd pods found in kube-system namespace" > "${TMPDIR}/etcd/status.txt"
+    return
+  fi
+
+  # Use the first pod for exec and TLS cert extraction
+  ETCD_POD=$(echo "$ETCD_PODS" | head -1)
+  techo "Using etcd pod for exec: $ETCD_POD"
+
+  # Extract TLS cert paths directly from the pod's command args.
+  # This works across kubeadm (/etc/kubernetes/pki/etcd/),
+  # RKE2 (/var/lib/rancher/rke2/server/tls/etcd/), and
+  # k3s  (/var/lib/rancher/k3s/server/tls/etcd/) without any hardcoded paths.
+  ETCD_CMD_ARGS=$(kubectl get pod -n kube-system "$ETCD_POD" \
+    -o jsonpath='{range .spec.containers[0].command[*]}{@}{"\n"}{end}' 2>/dev/null)
+
+  # Anchor greps to exact flag names to avoid matching --peer-trusted-ca-file, --peer-cert-file, etc.
+  CACERT=$(echo "$ETCD_CMD_ARGS" | grep '^--trusted-ca-file=' | head -1 | cut -d= -f2)
+  CERT=$(echo "$ETCD_CMD_ARGS" | grep '^--cert-file=' | head -1 | cut -d= -f2)
+  KEY=$(echo "$ETCD_CMD_ARGS" | grep '^--key-file=' | head -1 | cut -d= -f2)
+
+  if [[ -z "$CACERT" || -z "$CERT" || -z "$KEY" ]]; then
+    techo "Failed to extract etcd TLS cert paths from pod spec"
+    echo "Failed to extract etcd TLS cert paths from pod spec" > "${TMPDIR}/etcd/status.txt"
+    return
+  fi
+
+  techo "etcd cacert: $CACERT, cert: $CERT, key: $KEY"
+
+  ETCDCTL="ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=$CACERT --cert=$CERT --key=$KEY"
+
+  techo "Collecting etcd member list"
+  kubectl exec -n kube-system "$ETCD_POD" -- sh -c "$ETCDCTL member list -w table" \
+    > "${TMPDIR}/etcd/member-list.txt" 2>&1
+
+  techo "Collecting etcd endpoint status"
+  kubectl exec -n kube-system "$ETCD_POD" -- sh -c "$ETCDCTL endpoint status --cluster -w table" \
+    > "${TMPDIR}/etcd/endpoint-status.txt" 2>&1
+
+  techo "Collecting etcd endpoint health"
+  kubectl exec -n kube-system "$ETCD_POD" -- sh -c "$ETCDCTL endpoint health --cluster -w table" \
+    > "${TMPDIR}/etcd/endpoint-health.txt" 2>&1
+
+  techo "Collecting etcd alarm list"
+  kubectl exec -n kube-system "$ETCD_POD" -- sh -c "$ETCDCTL alarm list" \
+    > "${TMPDIR}/etcd/alarm-list.txt" 2>&1
+
+  techo "etcd status collection complete"
+}
+
 function k8s-resources() {
   if ! kubectl version >/dev/null 2>&1; then
     techo "kubectl command not found"
@@ -374,7 +445,8 @@ done
 is-kubeconfig-set || { echo "KUBECONFIG is not set. Unable to collect Kubernetes logs."; cleanup; exit 1; }
 spectro-k8s-defaults
 setup
-k8s-resources
-mongo-status
-archive
-cleanup
+# k8s-resources
+etcd-status
+# mongo-status
+# archive
+# cleanup
