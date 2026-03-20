@@ -270,7 +270,7 @@ function stylus-files() {
   techo "Collecting /oem files"
   mkdir -p $TMPDIR/oem
   ls -lah /oem/ > $TMPDIR/oem/files 2>&1
-  cp -prf /oem/* $TMPDIR/oem 2>&1
+  cp -prf /oem/. $TMPDIR/oem 2>&1
 
   techo "Collecting /run/stylus files"
   mkdir -p $TMPDIR/run/stylus
