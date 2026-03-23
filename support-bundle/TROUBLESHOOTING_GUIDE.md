@@ -19,7 +19,7 @@ There are two distinct bundle types with different scopes:
 | **Edge-specific files** | Yes (`/oem`, `/run/stylus`, cloud-config) | No |
 | **Container runtime logs** | Yes (crictl) | No |
 | **K8s resources** | Yes | Yes |
-| **Pod logs** | Yes | Yes (previous only) |
+| **Pod logs** | Yes | Yes |
 | **Distro detection** | Yes (k3s, rke2, kubeadm, Canonical) | No (cluster-agnostic) |
 
 **How to tell them apart:** Edge bundles have `journald/`, `systeminfo/`, `networking/`, `oem/` directories at the root. Infra bundles have only `k8s/` (plus `console.log` and `.support-bundle`).
@@ -32,9 +32,6 @@ There are two distinct bundle types with different scopes:
 <hostname>-YYYY-MM-DD_HH_MM_SS/
 ├── .support-bundle              # Bundle version (format: YYYYMMDD+githash)
 ├── console.log                  # Script execution log — check for collection errors
-├── pack-lifecycle-events.csv    # Pack install/update events (short form)
-├── pack-lifecycle-events-long.csv  # Pack events with durations (detailed)
-├── pack-timelines.csv           # Pack deployment timeline
 │
 ├── systeminfo/                  # Node OS information
 │   ├── hostname                 # Node hostname
@@ -69,7 +66,7 @@ There are two distinct bundle types with different scopes:
 ├── opt/spectrocloud/            # Binary checksums
 │
 ├── k8s/                         # Kubernetes cluster data
-│   ├── cluster-info/            # cluster-info dump, API server resources
+│   ├── cluster-info/            # cluster-info dump, API server resources, pod logs
 │   ├── cluster-resources/       # kubectl get outputs (YAML) for all resource types
 │   │   ├── nodes.yaml           # Node status, conditions, capacity
 │   │   ├── namespaces.yaml      # All namespaces
@@ -98,7 +95,7 @@ There are two distinct bundle types with different scopes:
 ├── .support-bundle              # Bundle version
 ├── console.log                  # Script execution log
 └── k8s/
-    ├── cluster-info/            # cluster-info dump, API resources
+    ├── cluster-info/            # cluster-info dump, API resources, pod logs
     ├── cluster-resources/       # kubectl get outputs (YAML)
     │   ├── nodes.yaml
     │   ├── namespaces.yaml
@@ -230,22 +227,6 @@ For pack deployment failures, registration issues, or upgrade problems:
 | Upgrade failure | `journald/stylus-operator.log` + pack CSVs | `"upgrade"`, `"failed"` + check pack timeline |
 | Startup/boot failure | `journald/journal-boot`, `journald/dmesg` | `"failed"`, `"error"` early in timeline |
 | etcd issues | `etcd/` directory + k3s/rke2 logs | `"etcd"`, `"snapshot"`, `"leader"` |
-
----
-
-## Pack Lifecycle CSV Files (Edge Only)
-
-The `pack-*.csv` files track the full deployment history:
-
-- **`pack-lifecycle-events-long.csv`** — all events with timestamps and durations; useful for finding slow/failed installs
-- **`pack-timelines.csv`** — shows start-to-finish timeline per pack
-
-**Key columns:** `pack_name`, `event_type` (pull/install/upgrade/delete), `timestamp`, `duration_seconds`, `status`
-
-Use these to:
-- Determine install order and timing
-- Identify which pack failed or was slow
-- Correlate pack events with log timestamps
 
 ---
 
