@@ -26,7 +26,7 @@ JOURNALD_LOGS=(
   # agent-mode
   spectro-stylus-agent spectro-stylus-operator spectro-init spectro-palette-agent-start spectro-palette-agent-initramfs spectro-palette-agent-boot spectro-palette-agent-network spectro-palette-agent-bootstrap
   # system
-  systemd-timesyncd
+  systemd-timesyncd chronyd
   # k8s
   containerd spectro-containerd kubelet k3s k3s-agent rke2-server rke2-agent
   # Canonical Kubernetes (snap-based) common units
@@ -284,6 +284,73 @@ function system-info() {
 
   cp -p /etc/hosts $TMPDIR/systeminfo/etchosts 2>&1
   cp -p /etc/resolv.conf $TMPDIR/systeminfo/etcresolvconf 2>&1
+}
+
+function chronyd-info() {
+  techo "Collecting chronyd time synchronization info"
+  mkdir -p $TMPDIR/chronyd
+
+  # Check if chronyc command exists
+  if ! command -v chronyc >/dev/null 2>&1; then
+    techo "chronyc command not found, skipping chronyd collection"
+    echo "chronyc command not found" > $TMPDIR/chronyd/not-installed 2>&1
+    return
+  fi
+
+  # Collect current system time and date information
+  date > $TMPDIR/chronyd/system-date 2>&1
+  timedatectl status > $TMPDIR/chronyd/timedatectl-status 2>&1 || techo "timedatectl not available"
+
+  # Collect chronyd tracking status (shows current time sync state)
+  chronyc tracking > $TMPDIR/chronyd/tracking 2>&1
+
+  # Collect NTP sources (shows all NTP servers being used)
+  chronyc sources -v > $TMPDIR/chronyd/sources-verbose 2>&1
+
+  # Collect source statistics
+  chronyc sourcestats -v > $TMPDIR/chronyd/sourcestats-verbose 2>&1
+
+  # Collect chronyd activity status
+  chronyc activity > $TMPDIR/chronyd/activity 2>&1
+
+  # Collect NTP server statistics (if server mode is enabled)
+  chronyc serverstats > $TMPDIR/chronyd/serverstats 2>&1
+
+  # Collect chronyd version
+  chronyc -v > $TMPDIR/chronyd/version 2>&1
+
+  # Collect chronyd service status
+  systemctl status chronyd > $TMPDIR/chronyd/service-status 2>&1 || techo "chronyd service not found in systemctl"
+
+  # Check if chronyd is enabled
+  systemctl is-enabled chronyd > $TMPDIR/chronyd/service-enabled 2>&1 || techo "chronyd service not enabled"
+
+  # Collect chronyd configuration files
+  if [ -f /etc/chrony.conf ]; then
+    cp -p /etc/chrony.conf $TMPDIR/chronyd/chrony.conf 2>&1
+    techo "Collected /etc/chrony.conf"
+  fi
+
+  if [ -f /etc/chrony/chrony.conf ]; then
+    cp -p /etc/chrony/chrony.conf $TMPDIR/chronyd/chrony.conf 2>&1
+    techo "Collected /etc/chrony/chrony.conf"
+  fi
+
+  # Collect chrony.d configuration directory if it exists
+  if [ -d /etc/chrony.d ]; then
+    mkdir -p $TMPDIR/chronyd/chrony.d
+    ls -lah /etc/chrony.d/ > $TMPDIR/chronyd/chrony.d/files 2>&1
+    cp -p /etc/chrony.d/* $TMPDIR/chronyd/chrony.d/ 2>&1
+    techo "Collected /etc/chrony.d/ configuration files"
+  fi
+
+  # Collect chrony drift file if it exists
+  if [ -f /var/lib/chrony/drift ]; then
+    cp -p /var/lib/chrony/drift $TMPDIR/chronyd/drift 2>&1
+    techo "Collected chronyd drift file"
+  fi
+
+  techo "Chronyd information collection complete"
 }
 
 function stylus-files() {
@@ -1062,6 +1129,7 @@ defaults
 setup
 sherlock
 system-info
+chronyd-info
 networking-info
 var-log
 journald-log

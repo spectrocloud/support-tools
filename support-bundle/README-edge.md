@@ -87,6 +87,7 @@ The script collects various types of information:
 * Network configuration
 * System services status
 * Host information
+* Time synchronization (chronyd/NTP configuration and status)
 
 ### Kubernetes Information
 * Cluster information
@@ -134,6 +135,12 @@ Output that is collected only from the node where the support bundle script is r
   * Journalctl output for related services (see `JOURNALD_LOGS` variable in script)
   * OS logs from /var/log
   * System service logs
+* Time synchronization:
+  * chronyd tracking status and NTP sources
+  * chronyd configuration files (/etc/chrony.conf, /etc/chrony.d/*)
+  * chronyd service status and drift file
+  * timedatectl status output
+  * systemd-timesyncd logs (if applicable)
 
 #### Kubernetes Distribution
 * Distribution-specific logs:
