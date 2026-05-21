@@ -126,10 +126,30 @@ function cleanup() {
   rm -rf "$TMPDIR" > /dev/null 2>&1
 }
 
+# Agent-mode kubeadm uses stylus crictl and spectro-containerd, not host defaults.
+function agent-mode-kubeadm-setup() {
+  if [ ! -f "${STYLUS_ROOT}/opt/spectrocloud/state/agent-mode" ]; then
+    return
+  fi
+
+  techo "Detected agent-mode kubeadm host"
+
+  if [ -x "${STYLUS_ROOT}/usr/bin/crictl" ]; then
+    CRICTL_BIN="${STYLUS_ROOT}/usr/bin/crictl"
+    techo "Using agent-mode crictl binary at ${CRICTL_BIN}"
+  fi
+
+  if [ -S "/run/spectro/containerd/containerd.sock" ]; then
+    export CONTAINER_RUNTIME_ENDPOINT="unix:///run/spectro/containerd/containerd.sock"
+    techo "Using agent-mode containerd socket at ${CONTAINER_RUNTIME_ENDPOINT}"
+  fi
+}
+
 function sherlock() {
   techo "Detecting k8s distribution"
   if (command -v kubeadm > /dev/null 2>&1); then
     DISTRO="kubeadm"
+    agent-mode-kubeadm-setup
   elif (command -v k3s > /dev/null 2>&1); then
     if k3s crictl ps >/dev/null 2>&1; then
         DISTRO="k3s"
