@@ -118,7 +118,7 @@ function archive() {
   tar -czf "${TMPDIR_BASE}/${LOGNAME}.tar.gz" -C "$TMPDIR_BASE" "$LOGNAME" || {
     techo "Failed to create tar file"
   }
-
+  sudo chown "$USER:$GROUP" ${TMPDIR_BASE}/${LOGNAME}.tar.gz
   techo "Logs are archived in ${TMPDIR_BASE}/${LOGNAME}.tar.gz"
 }
 
