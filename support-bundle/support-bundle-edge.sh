@@ -59,6 +59,103 @@ function techo() {
   echo "$(timestamp): $*"
 }
 
+function can-list-pods-in-namespace() {
+  local NS="$1"
+  [[ "$(kubectl auth can-i list pods -n "$NS" 2>/dev/null)" == "yes" ]]
+}
+
+function rbac-error-message() {
+  local NS_LIST="$*"
+  cat <<EOF
+ERROR: Cannot list pods in namespace(s): ${NS_LIST}
+
+The user running this script does not have permission to list pods in one or
+more targeted namespaces. Support bundles require pod access for meaningful
+diagnostics.
+
+Action: Check the ClusterRole or Role attached to the user or service account
+        running this script. Ensure it grants at least 'list' (and 'get') on
+        pods in the affected namespaces, for example:
+
+          rules:
+          - apiGroups: [""]
+            resources: [pods]
+            verbs: [get, list]
+
+Exiting without creating an incomplete bundle.
+EOF
+}
+
+function validate-namespace-coverage() {
+  local -a COLLECT_NAMESPACES=()
+  local -a SKIPPED_NAMESPACES=()
+  local -a RBAC_FAILURES=()
+  local NS REASON
+
+  if ! kubectl auth can-i list namespaces >/dev/null 2>&1; then
+    techo "ERROR: Cannot list namespaces — check ClusterRole/Role attached to the user running the script."
+    techo "Action: Ensure the user can list namespaces (verbs: get, list on resource namespaces)."
+    cleanup
+    exit 1
+  fi
+
+  for NS in "${SYSTEM_NAMESPACES[@]}"; do
+    if ! kubectl get ns "$NS" >/dev/null 2>&1; then
+      SKIPPED_NAMESPACES+=("${NS}|namespace not found")
+      continue
+    fi
+
+    if ! can-list-pods-in-namespace "$NS"; then
+      RBAC_FAILURES+=("$NS")
+      continue
+    fi
+
+    COLLECT_NAMESPACES+=("$NS")
+  done
+
+  {
+    echo "Namespace Coverage Summary"
+    echo "Generated: $(timestamp)"
+    echo ""
+    printf "%-12s %-40s %s\n" "STATUS" "NAMESPACE" "NOTES"
+    printf "%-12s %-40s %s\n" "------" "---------" "-----"
+    for NS in "${COLLECT_NAMESPACES[@]}"; do
+      printf "%-12s %-40s %s\n" "COLLECT" "$NS" "accessible"
+    done
+    for ENTRY in "${SKIPPED_NAMESPACES[@]}"; do
+      NS="${ENTRY%%|*}"
+      REASON="${ENTRY#*|}"
+      printf "%-12s %-40s %s\n" "SKIP" "$NS" "$REASON"
+    done
+    for NS in "${RBAC_FAILURES[@]}"; do
+      printf "%-12s %-40s %s\n" "DENIED" "$NS" "cannot list pods (RBAC)"
+    done
+    echo ""
+    echo "Namespaces to collect: ${#COLLECT_NAMESPACES[@]}"
+    echo "Namespaces skipped:    ${#SKIPPED_NAMESPACES[@]}"
+    if [[ ${#RBAC_FAILURES[@]} -gt 0 ]]; then
+      echo "Namespaces denied:     ${#RBAC_FAILURES[@]}"
+    fi
+  } | tee "${TMPDIR}/namespace-coverage.txt"
+
+  techo "Namespace coverage summary written to namespace-coverage.txt"
+
+  if [[ ${#RBAC_FAILURES[@]} -gt 0 ]]; then
+    rbac-error-message "${RBAC_FAILURES[*]}"
+    cleanup
+    exit 1
+  fi
+
+  if [[ ${#COLLECT_NAMESPACES[@]} -eq 0 ]]; then
+    techo "ERROR: No namespaces available for collection after coverage validation."
+    techo "Action: Verify cluster access and that at least one targeted namespace exists and is accessible."
+    cleanup
+    exit 1
+  fi
+
+  SYSTEM_NAMESPACES=("${COLLECT_NAMESPACES[@]}")
+}
+
 function setup() {
   TMPDIR_BASE=$(mktemp -d $MKTEMP_BASEDIR) || { techo 'Creating temporary directory failed, please check options'; exit 1; }
   techo "Created temporary directory: $TMPDIR_BASE"
@@ -1170,6 +1267,7 @@ stylus-files
 crictl-logs
 set-kubeconfig
 spectro-k8s-defaults
+validate-namespace-coverage
 k8s-resources
 if [ "${DISTRO}" = "kubeadm" ]; then
   var-log-pods
