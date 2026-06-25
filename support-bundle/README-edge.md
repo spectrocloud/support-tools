@@ -105,6 +105,7 @@ The script collects various types of information:
 ### Edge-specific Information
 * Stylus agent logs
 * Palette agent logs
+* Installation-time logs
 * Edge cluster configuration
 * System upgrade information
 
@@ -192,6 +193,7 @@ Output that is collected from the cluster. Note that pod logs from other nodes a
 
 * Stylus agent logs and configuration
 * Palette agent logs and status
+* Installation-time logs (collected only if present)
 * Edge cluster configuration
 * System upgrade information
 * Edge-specific custom resources

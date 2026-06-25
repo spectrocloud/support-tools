@@ -384,6 +384,26 @@ function stylus-files() {
     techo "bundle-pkg index.json not found at /usr/local/spectrocloud/bundle/bundle-pkg/index.json"
   fi
 
+  # collect installer.log if exists
+  techo "Collecting installer.log if exists"
+  if [ -f "/usr/local/installer.log" ]; then
+    mkdir -p $TMPDIR/usr/local
+    cp -p "/usr/local/installer.log" "$TMPDIR/usr/local/" 2>&1
+    techo "Collected installer.log"
+  else
+    techo "installer.log not found at /usr/local/installer.log"
+  fi
+
+  # collect stylus-content-script.log if exists
+  techo "Collecting stylus-content-script.log if exists"
+  if [ -f "/usr/local/spectrocloud/stylus-content-script.log" ]; then
+    mkdir -p $TMPDIR/usr/local/spectrocloud
+    cp -p "/usr/local/spectrocloud/stylus-content-script.log" "$TMPDIR/usr/local/spectrocloud/" 2>&1
+    techo "Collected stylus-content-script.log"
+  else
+    techo "stylus-content-script.log not found at /usr/local/spectrocloud/stylus-content-script.log"
+  fi
+
   # collect containerd config.toml if exists
   techo "Collecting containerd config.toml if exists"
   if [ -f "/etc/containerd/config.toml" ]; then
