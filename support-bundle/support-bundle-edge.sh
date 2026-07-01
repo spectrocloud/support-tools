@@ -671,6 +671,17 @@ function mongo-status() {
 
   techo "Collecting MongoDB replication info"
   kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'rs.printReplicationInfo()'" > "${TMPDIR}/mongo/replication-info.txt" 2>&1
+
+  techo "Collecting MongoDB per-pod disk usage (df)"
+  : > "${TMPDIR}/mongo/disk-usage.txt"
+  while IFS= read -r POD; do
+    [ -n "$POD" ] || continue
+    {
+      echo "== $POD =="
+      kubectl exec -n hubble-system "$POD" -c mongo -- df -h /var/lib/mongodb 2>&1
+      echo
+    } >> "${TMPDIR}/mongo/disk-usage.txt"
+  done < <(printf '%s\n' "$MONGO_PODS")
 }
 
 function k8s-resources() {

@@ -150,6 +150,7 @@ For Enterprise and PCG clusters, the script collects MongoDB replica set informa
 * `rs-status.json`: Replica set status including member health, sync state, and election info
 * `rs-conf.json`: Replica set configuration including member settings and priorities
 * `replication-info.txt`: Oplog information and replication window
+* `disk-usage.txt`: Actual `df -h /var/lib/mongodb` per mongo pod — the real on-disk size, which can differ from the requested PVC/PV size on thin-provisioned or fixed-disk-offering backends (e.g. CloudStack fixed offerings)
 
 ## Important Notes
 
