@@ -192,6 +192,17 @@ function mongo-status() {
       echo
     } >> "${TMPDIR}/mongo/disk-usage.txt"
   done < <(printf '%s\n' "$MONGO_PODS")
+
+  techo "Collecting MongoDB database + collection sizes"
+  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval '
+    db.adminCommand({listDatabases:1}).databases.forEach(function(d){
+      var s = db.getSiblingDB(d.name).stats(1024*1024);
+      print(\"DB \"+d.name+\" storageSize(MB)=\"+s.storageSize+\" dataSize(MB)=\"+s.dataSize);
+      db.getSiblingDB(d.name).getCollectionNames().forEach(function(c){
+        var cs = db.getSiblingDB(d.name).getCollection(c).stats(1024*1024);
+        print(\"  \"+d.name+\".\"+c+\" storageSize(MB)=\"+cs.storageSize+\" size(MB)=\"+cs.size+\" count=\"+cs.count);
+      });
+    });'" > "${TMPDIR}/mongo/db-collection-sizes.txt" 2>&1
 }
 
 function k8s-resources() {
