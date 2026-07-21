@@ -40,9 +40,10 @@ SYSTEM_NAMESPACES=(capa-system capi-kubeadm-bootstrap-system capi-kubeadm-contro
 
 API_RESOURCES=(apiservices clusterroles clusterrolebindings crds csr mutatingwebhookconfigurations namespaces nodes priorityclasses pv storageclasses validatingwebhookconfigurations volumeattachments)
 
-API_RESOURCES_NAMESPACED=(apiservices configmaps cronjobs daemonsets deployments endpoints endpointslices events hpa ingress jobs leases limitranges networkpolicies poddisruptionbudgets pods pvc replicasets resourcequotas roles rolebindings services serviceaccounts statefulsets)
+API_RESOURCES_NAMESPACED=(apiservices configmaps cronjobs daemonsets deployments endpoints endpointslices events hpa ingress jobs leases limitranges networkpolicies poddisruptionbudgets pods pvc replicationcontrollers replicasets resourcequotas roles rolebindings services serviceaccounts statefulsets)
 
-VAR_LOG_LINES=500000
+VAR_LOG_LINES="${VAR_LOG_LINES:-500000}"
+MAX_FILE_BYTES="${MAX_FILE_BYTES:-524288000}"
 
 function load-env() {
   if [ -f /etc/spectro/environment ]; then
@@ -57,6 +58,47 @@ function timestamp() {
 
 function techo() {
   echo "$(timestamp): $*"
+}
+
+# Record an oversized file skipped from the bundle.
+# Args: path apparent_bytes reason
+function manifest-note() {
+  [ -n "$TMPDIR" ] || return 0
+  echo "$(timestamp) $1 apparent=$2 reason=$3" >> "${TMPDIR}/collection-warnings.txt"
+}
+
+# Copy a file unless it exceeds the cap.
+function copy-with-cap() {
+  local src="$1" dst_dir="$2"
+  [ -f "$src" ] || return 0
+  local apparent
+  apparent=$(stat -c %s "$src" 2>/dev/null || echo 0)
+  if [ -n "$apparent" ] && [ "$apparent" -gt "$MAX_FILE_BYTES" ] 2>/dev/null; then
+    manifest-note "$src" "$apparent" "exceeds MAX_FILE_BYTES=${MAX_FILE_BYTES}"
+    return 0
+  fi
+  cp -p "$src" "$dst_dir" 2>&1
+}
+
+# Copy a tree with per-file caps and preserved symlinks.
+function cp-tree-with-cap() {
+  local src="$1" dst="$2"
+  [ -e "$src" ] || return 0
+  mkdir -p "$dst"
+  find "$src" -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
+    local rel="${f#$src/}"
+    local sub_dir
+    sub_dir="$dst/$(dirname "$rel")"
+    mkdir -p "$sub_dir"
+    copy-with-cap "$f" "$sub_dir"
+  done
+  find "$src" -type l -print0 2>/dev/null | while IFS= read -r -d '' l; do
+    local rel="${l#$src/}"
+    local sub_dir
+    sub_dir="$dst/$(dirname "$rel")"
+    mkdir -p "$sub_dir"
+    cp -P "$l" "$sub_dir/" 2>/dev/null
+  done
 }
 
 function setup() {
@@ -97,14 +139,20 @@ function canonical-k8s-setup() {
 }
 
 function defaults() {
+  # Apply the line cap even with date filters.
   CRICTL_FLAGS+=" --tail=${VAR_LOG_LINES}"
+  JOURNALD_FLAGS+=" -n ${VAR_LOG_LINES}"
+  techo "Log line cap: ${VAR_LOG_LINES}"
+  techo "Per-file byte cap: ${MAX_FILE_BYTES}"
   techo "Using Crictl flags: ${CRICTL_FLAGS}"
-  
-  if [ -z "$JOURNALD_FLAGS" ]; then
-    JOURNALD_FLAGS+=" -n ${VAR_LOG_LINES}"
-    techo "No number of log lines defined for collection. Collecting last 500k log lines from journald and crictl logs"
+  techo "Using Journald flags: ${JOURNALD_FLAGS}"
+
+  # Use sparse archives when supported.
+  if tar --help 2>&1 | grep -q -- '--sparse'; then
+    TAR_SPARSE_FLAG="--sparse"
   else
-    techo "Using Journald flags: ${JOURNALD_FLAGS}"
+    TAR_SPARSE_FLAG=""
+    techo "Warning: tar does not support --sparse; sparse files may inflate in the archive"
   fi
 }
 
@@ -115,7 +163,7 @@ function archive() {
   # Restore original fds to close tee pipe and flush console.log
   exec 1>&3 2>&4
   
-  tar -czf "${TMPDIR_BASE}/${LOGNAME}.tar.gz" -C "$TMPDIR_BASE" "$LOGNAME" || {
+  tar ${TAR_SPARSE_FLAG} -czf "${TMPDIR_BASE}/${LOGNAME}.tar.gz" -C "$TMPDIR_BASE" "$LOGNAME" || {
     techo "Failed to create tar file"
   }
 
@@ -232,22 +280,22 @@ function kubectl() {
 }
 
 function var-log() {
-  techo "Collecting logs from /var/log"
-  mkdir -p $TMPDIR/var/log
+  techo "Collecting text logs from /var/log (block-capped)"
+  mkdir -p "$TMPDIR/var/log"
   for logfile in /var/log/*log*; do
-    if file "$logfile" | grep -q "text"; then
-      cp -p "$logfile" "$TMPDIR/var/log" 2>&1
+    if [ -f "$logfile" ] && file "$logfile" | grep -q "text"; then
+      copy-with-cap "$logfile" "$TMPDIR/var/log"
     fi
   done
 
   # Collect SpectroCloud logs written by system tasks (e.g. cert renewal)
   if [ -d /var/log/spectrocloud ]; then
-    techo "Collecting logs from /var/log/spectrocloud"
+    techo "Collecting text logs from /var/log/spectrocloud (block-capped)"
     mkdir -p "$TMPDIR/var/log/spectrocloud"
     ls -lah /var/log/spectrocloud/ > "$TMPDIR/var/log/spectrocloud/files" 2>&1
     for logfile in /var/log/spectrocloud/*; do
       if [ -f "$logfile" ] && file "$logfile" | grep -q "text"; then
-        cp -p "$logfile" "$TMPDIR/var/log/spectrocloud" 2>&1
+        copy-with-cap "$logfile" "$TMPDIR/var/log/spectrocloud"
       fi
     done
   fi
@@ -255,7 +303,7 @@ function var-log() {
 
 function journald-log() {
   techo "Collecting logs from journald using flags ${JOURNALD_FLAGS}"
-  mkdir -p $TMPDIR/journald
+  mkdir -p "$TMPDIR/journald"
 
   journalctl --no-pager -k $JOURNALD_FLAGS >"$TMPDIR/journald/dmesg"
   journalctl --no-pager --list-boot $JOURNALD_FLAGS >"$TMPDIR/journald/journal-boot"
@@ -697,9 +745,8 @@ function k8s-resources() {
   kubectl version -o yaml > "${TMPDIR}/k8s/cluster-info/cluster-version.yaml" 2>&1
   kubectl cluster-info > "${TMPDIR}/k8s/cluster-info/cluster-info" 2>&1
 
-  techo "Collecting k8s cluster-info dump"
-  mkdir -p "${TMPDIR}/k8s/cluster-info/dump"
-  kubectl cluster-info dump --namespaces "$(IFS=,; echo "${SYSTEM_NAMESPACES[*]}")" --output-directory="${TMPDIR}/k8s/cluster-info/dump" --output=yaml 2>&1
+  # Explicit resource collection and capped pod logs replace cluster-info dump.
+  # Stored at: k8s/cluster-resources/ and k8s/pod-logs-current/.
   kubectl api-resources -o wide > "${TMPDIR}/k8s/cluster-info/api-resources" 2>&1
 
   techo "Collecting k8s resources"
@@ -763,24 +810,32 @@ function k8s-resources() {
   kubectl top pods --all-namespaces > "${TMPDIR}/k8s/metrics/pods-metrics" 2>&1
   kubectl top pods --all-namespaces --containers > "${TMPDIR}/k8s/metrics/pods-containers-metrics" 2>&1
 
-  techo "Collecting logs from previous pods"
-  mkdir -p "${TMPDIR}/k8s/previous-pod-logs"
+  techo "Collecting current and previous pod logs (capped at ${VAR_LOG_LINES} lines per container-stream)"
+  mkdir -p "${TMPDIR}/k8s/pod-logs-current" "${TMPDIR}/k8s/previous-pod-logs"
   for NS in "${SYSTEM_NAMESPACES[@]}"; do
     for POD in $(kubectl get pods -n "$NS" --no-headers -o custom-columns="NAME:.metadata.name"); do
-      LOGS=$(kubectl logs -n "$NS" "$POD" --all-containers --previous 2>&1)
-      if [[ -n "$LOGS" ]]; then
+      CURRENT=$(kubectl logs -n "$NS" "$POD" --all-containers --tail="${VAR_LOG_LINES}" 2>&1)
+      if [[ -n "$CURRENT" ]]; then
+        mkdir -p "${TMPDIR}/k8s/pod-logs-current/${NS}/${POD}"
+        echo "$CURRENT" > "${TMPDIR}/k8s/pod-logs-current/${NS}/${POD}/current.log"
+      fi
+      PREVIOUS=$(kubectl logs -n "$NS" "$POD" --all-containers --previous --tail="${VAR_LOG_LINES}" 2>&1)
+      if [[ -n "$PREVIOUS" ]]; then
         mkdir -p "${TMPDIR}/k8s/previous-pod-logs/${NS}/${POD}"
-        echo "$LOGS" > "${TMPDIR}/k8s/previous-pod-logs/${NS}/${POD}/previous.log"
+        echo "$PREVIOUS" > "${TMPDIR}/k8s/previous-pod-logs/${NS}/${POD}/previous.log"
       fi
     done
   done
 }
 
 function var-log-pods() {
-  techo "Collecting k8s pod logs"
+  techo "Collecting k8s pod logs from /var/log/pods (block-capped)"
   mkdir -p "${TMPDIR}/k8s/pod-logs"
   for NS in "${SYSTEM_NAMESPACES[@]}"; do
-    cp -prf /var/log/pods/"$NS"* "${TMPDIR}/k8s/pod-logs" 2>&1
+    for POD_DIR in /var/log/pods/"$NS"*; do
+      [ -d "$POD_DIR" ] || continue
+      cp-tree-with-cap "$POD_DIR" "${TMPDIR}/k8s/pod-logs/$(basename "$POD_DIR")"
+    done
   done
 }
 
@@ -1063,7 +1118,10 @@ function help() {
   -e    End day of journald log collection. Specify the number of days before the current time (ex: -e 5)
   -S    Start date of journald log collection. (ex: -S 2024-01-01)
   -E    End date of journald log collection. (ex: -E 2024-01-01)
-  -l    Number of log lines to collect from journald logs. (ex: -l 500000)
+  -l    Log-line cap applied to journald, crictl, and kubectl pod logs. (ex: -l 100000; default 500000)
+  -m    Per-file cap for host-file collection in MiB, measured by apparent size.
+        Files exceeding this size are skipped and recorded in collection-warnings.txt.
+        Env: MAX_FILE_BYTES remains in bytes. (ex: -m 1024; default 500 MiB)
   -j    Additional journald logs to collect. (ex: -j cloud-init,cloud-init-local)
 
   # kubernetes specific flags
@@ -1082,7 +1140,7 @@ if [[ $EUID -ne 0 ]] && [[ "${DEV}" == "" ]]
     exit 1
 fi
 
-while getopts "d:s:e:S:E:l:n:r:R:j:h" opt; do
+while getopts "d:s:e:S:E:l:m:n:r:R:j:h" opt; do
   case $opt in
   d)
     MKTEMP_BASEDIR="-p ${OPTARG}"
@@ -1113,10 +1171,16 @@ while getopts "d:s:e:S:E:l:n:r:R:j:h" opt; do
     techo "Collecting logs until ${OPTARG}"
     ;;
   l)
-    NUM_LINES="${OPTARG}"
-    JOURNALD_FLAGS+=" -n ${NUM_LINES}"
-    CRICTL_FLAGS+=" --tail=${NUM_LINES}"
-    techo "Collecting most recent ${OPTARG} from journald and crictl logs"
+    VAR_LOG_LINES="${OPTARG}"
+    techo "Log line cap overridden to ${VAR_LOG_LINES}"
+    ;;
+  m)
+    if ! [[ "${OPTARG}" =~ ^[1-9][0-9]*$ ]]; then
+      techo "Invalid per-file cap '${OPTARG}'; -m requires a positive whole number of MiB"
+      exit 1
+    fi
+    MAX_FILE_BYTES=$((OPTARG * 1024 * 1024))
+    techo "Per-file cap overridden to ${OPTARG} MiB (${MAX_FILE_BYTES} bytes)"
     ;;
   n)
     NAMESPACES=${OPTARG}
