@@ -294,9 +294,19 @@ function techo() {
   echo "$(timestamp): $*"
 }
 
+function can-i-list() {
+  local RESOURCE="$1"
+  local NS="${2:-}"
+  if [[ -n "$NS" ]]; then
+    [[ "$(kubectl auth can-i list "$RESOURCE" -n "$NS" 2>/dev/null)" == "yes" ]]
+  else
+    [[ "$(kubectl auth can-i list "$RESOURCE" 2>/dev/null)" == "yes" ]]
+  fi
+}
+
 function can-list-pods-in-namespace() {
   local NS="$1"
-  [[ "$(kubectl auth can-i list pods -n "$NS" 2>/dev/null)" == "yes" ]]
+  can-i-list pods "$NS"
 }
 
 function rbac-error-message() {
@@ -321,18 +331,50 @@ Exiting without creating an incomplete bundle.
 EOF
 }
 
+function cluster-rbac-error-message() {
+  local RESOURCE_LIST="$*"
+  cat <<EOF
+ERROR: Cannot list cluster-scoped resource(s): ${RESOURCE_LIST}
+
+The user running this script does not have permission to list one or more
+cluster-scoped resources required for a complete support bundle.
+
+Action: Check the ClusterRole attached to the user or service account running
+        this script. Ensure it grants at least 'list' (and 'get') on the denied
+        resources, for example:
+
+          rules:
+          - apiGroups: [""]
+            resources: [namespaces, nodes]
+            verbs: [get, list]
+          - apiGroups: [apiextensions.k8s.io]
+            resources: [customresourcedefinitions]
+            verbs: [get, list]
+
+Exiting without creating an incomplete bundle.
+EOF
+}
+
 function validate-namespace-coverage() {
   local -a COLLECT_NAMESPACES=()
   local -a SKIPPED_NAMESPACES=()
   local -a RBAC_FAILURES=()
-  local NS REASON
+  local -a CLUSTER_RBAC_OK=()
+  local -a CLUSTER_RBAC_FAILURES=()
+  local -a REQUIRED_CLUSTER_LIST=(
+    namespaces
+    nodes
+    customresourcedefinitions.apiextensions.k8s.io
+  )
+  local NS REASON RESOURCE
 
-  if ! kubectl auth can-i list namespaces >/dev/null 2>&1; then
-    techo "ERROR: Cannot list namespaces — check ClusterRole/Role attached to the user running the script."
-    techo "Action: Ensure the user can list namespaces (verbs: get, list on resource namespaces)."
-    cleanup
-    exit 1
-  fi
+  for RESOURCE in "${REQUIRED_CLUSTER_LIST[@]}"; do
+    if can-i-list "$RESOURCE"; then
+      CLUSTER_RBAC_OK+=("$RESOURCE")
+    else
+      CLUSTER_RBAC_FAILURES+=("$RESOURCE")
+    fi
+  done
 
   for NS in "${SYSTEM_NAMESPACES[@]}"; do
     if ! kubectl get ns "$NS" >/dev/null 2>&1; then
@@ -349,9 +391,20 @@ function validate-namespace-coverage() {
   done
 
   {
-    echo "Namespace Coverage Summary"
+    echo "RBAC / Namespace Coverage Summary"
     echo "Generated: $(timestamp)"
     echo ""
+    echo "Cluster-scoped permissions"
+    printf "%-12s %-50s %s\n" "STATUS" "RESOURCE" "NOTES"
+    printf "%-12s %-50s %s\n" "------" "--------" "-----"
+    for RESOURCE in "${CLUSTER_RBAC_OK[@]}"; do
+      printf "%-12s %-50s %s\n" "ALLOWED" "$RESOURCE" "can list"
+    done
+    for RESOURCE in "${CLUSTER_RBAC_FAILURES[@]}"; do
+      printf "%-12s %-50s %s\n" "DENIED" "$RESOURCE" "cannot list (RBAC)"
+    done
+    echo ""
+    echo "Namespace coverage"
     printf "%-12s %-40s %s\n" "STATUS" "NAMESPACE" "NOTES"
     printf "%-12s %-40s %s\n" "------" "---------" "-----"
     for NS in "${COLLECT_NAMESPACES[@]}"; do
@@ -366,14 +419,22 @@ function validate-namespace-coverage() {
       printf "%-12s %-40s %s\n" "DENIED" "$NS" "cannot list pods (RBAC)"
     done
     echo ""
-    echo "Namespaces to collect: ${#COLLECT_NAMESPACES[@]}"
-    echo "Namespaces skipped:    ${#SKIPPED_NAMESPACES[@]}"
+    echo "Cluster resources allowed: ${#CLUSTER_RBAC_OK[@]}"
+    echo "Cluster resources denied:  ${#CLUSTER_RBAC_FAILURES[@]}"
+    echo "Namespaces to collect:     ${#COLLECT_NAMESPACES[@]}"
+    echo "Namespaces skipped:        ${#SKIPPED_NAMESPACES[@]}"
     if [[ ${#RBAC_FAILURES[@]} -gt 0 ]]; then
-      echo "Namespaces denied:     ${#RBAC_FAILURES[@]}"
+      echo "Namespaces denied:         ${#RBAC_FAILURES[@]}"
     fi
   } | tee "${TMPDIR}/namespace-coverage.txt"
 
   techo "Namespace coverage summary written to namespace-coverage.txt"
+
+  if [[ ${#CLUSTER_RBAC_FAILURES[@]} -gt 0 ]]; then
+    cluster-rbac-error-message "${CLUSTER_RBAC_FAILURES[*]}"
+    cleanup
+    exit 1
+  fi
 
   if [[ ${#RBAC_FAILURES[@]} -gt 0 ]]; then
     rbac-error-message "${RBAC_FAILURES[*]}"
