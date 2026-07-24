@@ -669,12 +669,42 @@ function gpu-info() {
       done
     fi
 
-    # nvidia-bug-report.sh — if the driver package installed it, it produces
-    # a comprehensive dump on its own. Can take ~60s on a healthy system,
-    # longer on a wedged one. Hard-cap at 3 min so it can't block the bundle.
+    # nvidia-bug-report.sh — NVIDIA driver's built-in diagnostic collector.
+    # Ships in the nvidia-utils/driver package. On Palette NVIDIA appliances
+    # the driver + userspace tools live inside the GPU Operator's driver
+    # DaemonSet container, NOT on the host (Kairos is minimal). So: try the
+    # host binary first, then fall back to kubectl exec into any pod in
+    # gpu-operator or launchpad-ai that has the tool.
+    # Read-only from a system perspective (only writes to its output file);
+    # hard 180s cap because it can hang on a wedged GPU.
+    NVIDIA_BUG_REPORT_CAPTURED=0
     if command -v nvidia-bug-report.sh >/dev/null 2>&1; then
-      techo "Running nvidia-bug-report.sh (bounded at 180s)"
-      timeout 180 sh -c "cd '$TMPDIR/gpu/nvidia' && nvidia-bug-report.sh --output-file nvidia-bug-report.log.gz" >/dev/null 2>&1 || echo "(nvidia-bug-report.sh timed out or failed — check nvidia-smi output above instead)" > "$TMPDIR/gpu/nvidia/nvidia-bug-report-status"
+      techo "Running nvidia-bug-report.sh on host (bounded at 180s)"
+      if timeout 180 sh -c "cd '$TMPDIR/gpu/nvidia' && nvidia-bug-report.sh --output-file nvidia-bug-report.log.gz" >/dev/null 2>&1; then
+        NVIDIA_BUG_REPORT_CAPTURED=1
+      fi
+    fi
+    if [ "$NVIDIA_BUG_REPORT_CAPTURED" = "0" ] && kubectl version >/dev/null 2>&1; then
+      # Fallback: exec inside any driver / validator / vLLM pod that ships
+      # the tool. Stream the .gz back over stdout so we don't need kubectl cp
+      # or an in-pod cleanup step.
+      for NS in gpu-operator launchpad-ai; do
+        for CAND in $(timeout 10 kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
+          if timeout 10 kubectl -n "$NS" exec "$CAND" -- sh -c 'command -v nvidia-bug-report.sh' >/dev/null 2>&1; then
+            techo "Running nvidia-bug-report.sh via $NS/$CAND (bounded at 180s)"
+            if timeout 180 kubectl -n "$NS" exec "$CAND" -- sh -c 'nvidia-bug-report.sh --output-file /tmp/nvidia-bug-report-sb.log.gz >/dev/null 2>&1 && cat /tmp/nvidia-bug-report-sb.log.gz && rm -f /tmp/nvidia-bug-report-sb.log.gz' > "$TMPDIR/gpu/nvidia/nvidia-bug-report.log.gz" 2>/dev/null; then
+              # Sanity check: empty file = something went wrong
+              if [ -s "$TMPDIR/gpu/nvidia/nvidia-bug-report.log.gz" ]; then
+                NVIDIA_BUG_REPORT_CAPTURED=1
+                break 2
+              fi
+            fi
+          fi
+        done
+      done
+    fi
+    if [ "$NVIDIA_BUG_REPORT_CAPTURED" = "0" ]; then
+      echo "nvidia-bug-report.sh not found on host or in any candidate pod (gpu-operator/launchpad-ai). Check nvidia-smi output in this dir instead." > "$TMPDIR/gpu/nvidia/nvidia-bug-report-status"
     fi
 
     if [ -d /var/log/nvidia-devcoredump ]; then
