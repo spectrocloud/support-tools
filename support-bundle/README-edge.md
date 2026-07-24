@@ -199,6 +199,20 @@ Output that is collected from the cluster. Note that pod logs from other nodes a
 * Edge-specific custom resources
 * Edge networking configuration
 
+### Storage / LVM / NVMe Collection
+
+Palette edge hosts run on LVM (`spectro-data-vg` / `spectro-data-lv` with the persistent partition at `/opt`), and AI appliances additionally park model weights under `/opt/data/spectrocloud/models/` (hundreds of GB per model). Storage health is load-bearing for triage. The `storage-info` step collects:
+
+* `lsblk -f` (filesystem labels/UUIDs/mountpoints) and detailed `lsblk` with model/serial/transport/rotational
+* `df -h` and `df -i` (filesystem + inode usage)
+* `/proc/mounts` and `/etc/fstab`
+* `fdisk -l` (partition tables) — when available
+* LVM: `pvdisplay`, `vgdisplay`, `lvdisplay` and their compact counterparts `pvs` / `vgs` / `lvs` — when LVM tools are installed
+* NVMe: `nvme list`, `nvme id-ctrl`, `nvme smart-log` per drive — when `nvme-cli` is installed
+* SMART: `smartctl -a` per block device — when `smartmontools` is installed
+
+Silently skips per-tool blocks when the binary isn't present, so this is safe on any host.
+
 ### AI / GPU Collection (launchpad-ai appliances)
 
 For AI-inference appliances (`launchpad-ai`) and other GPU-bearing edge nodes, the script collects vendor-specific GPU state alongside the standard Kubernetes and system collection. Emits an empty `gpu/` directory on non-GPU hosts — safe to run everywhere.

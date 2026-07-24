@@ -438,6 +438,63 @@ function journald-log() {
   journalctl --no-pager $JOURNALD_FLAGS >"$TMPDIR/journald/journalctl"
 }
 
+function storage-info() {
+  # Collect host storage state — block devices, filesystems, LVM, NVMe.
+  # Palette edge hosts run on LVM (spectro-data-vg / spectro-data-lv) with
+  # the persistent partition at /opt; AI appliances additionally park model
+  # weights under /opt/data/spectrocloud/models/ (hundreds of GB), so LVM
+  # health and NVMe state are load-bearing for troubleshooting.
+  techo "Collecting storage info"
+  mkdir -p "$TMPDIR/storage"
+
+  # Block devices + filesystems
+  if command -v lsblk >/dev/null 2>&1; then
+    lsblk -f > "$TMPDIR/storage/lsblk-f.txt" 2>&1
+    lsblk -o NAME,SIZE,TYPE,MOUNTPOINTS,FSTYPE,LABEL,UUID,MODEL,SERIAL,TRAN,ROTA,STATE > "$TMPDIR/storage/lsblk-detail.txt" 2>&1
+  fi
+
+  # Filesystem usage
+  df -h > "$TMPDIR/storage/df-h.txt" 2>&1
+  df -i > "$TMPDIR/storage/df-i.txt" 2>&1
+
+  # Mount state
+  cat /proc/mounts > "$TMPDIR/storage/proc-mounts" 2>&1
+  [ -f /etc/fstab ] && cp -p /etc/fstab "$TMPDIR/storage/etc-fstab" 2>&1
+
+  # Partition tables
+  if command -v fdisk >/dev/null 2>&1; then
+    fdisk -l > "$TMPDIR/storage/fdisk-l.txt" 2>&1
+  fi
+
+  # LVM (Palette persistent partition is LVM-backed by default)
+  if command -v pvdisplay >/dev/null 2>&1; then
+    pvdisplay > "$TMPDIR/storage/pvdisplay.txt" 2>&1
+    vgdisplay > "$TMPDIR/storage/vgdisplay.txt" 2>&1
+    lvdisplay > "$TMPDIR/storage/lvdisplay.txt" 2>&1
+    pvs > "$TMPDIR/storage/pvs.txt" 2>&1
+    vgs > "$TMPDIR/storage/vgs.txt" 2>&1
+    lvs > "$TMPDIR/storage/lvs.txt" 2>&1
+  fi
+
+  # NVMe inventory + SMART health (per-drive)
+  if command -v nvme >/dev/null 2>&1; then
+    nvme list > "$TMPDIR/storage/nvme-list.txt" 2>&1
+    for dev in /dev/nvme[0-9]*n[0-9]*; do
+      [ -b "$dev" ] || continue
+      name=$(basename "$dev")
+      nvme id-ctrl "$dev" > "$TMPDIR/storage/nvme-idctrl-${name}.txt" 2>&1 || true
+      nvme smart-log "$dev" > "$TMPDIR/storage/nvme-smart-${name}.txt" 2>&1 || true
+    done
+  fi
+  if command -v smartctl >/dev/null 2>&1; then
+    for dev in /dev/nvme[0-9]*n[0-9]* /dev/sd? /dev/nvme[0-9]*; do
+      [ -b "$dev" ] || continue
+      name=$(basename "$dev")
+      smartctl -a "$dev" > "$TMPDIR/storage/smartctl-${name}.txt" 2>&1 || true
+    done
+  fi
+}
+
 function gpu-info() {
   # Collect GPU host state for AI/inference appliances (launchpad-ai and other
   # GPU-bearing edge nodes). Emits an empty gpu/ directory on nodes with no
@@ -1509,6 +1566,7 @@ chronyd-info
 networking-info
 var-log
 journald-log
+storage-info
 gpu-info
 
 stylus-files
