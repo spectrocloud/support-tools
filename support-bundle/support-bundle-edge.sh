@@ -493,6 +493,40 @@ function storage-info() {
       smartctl -a "$dev" > "$TMPDIR/storage/smartctl-${name}.txt" 2>&1 || true
     done
   fi
+
+  # sysfs block device attributes — mirrors what stylus/pkg/disk reads for
+  # disk enumeration (dm UUIDs for LVM/dm-crypt/multipath, rotational flag
+  # for SSD vs HDD, hidden flag, raw size). All read-only sysfs paths.
+  if [ -d /sys/block ]; then
+    {
+      for d in /sys/block/*; do
+        [ -d "$d" ] || continue
+        name=$(basename "$d")
+        printf "=== %s ===\n" "$name"
+        for attr in size hidden removable ro queue/rotational queue/scheduler dm/name dm/uuid device/model device/vendor device/serial; do
+          [ -r "$d/$attr" ] && printf "  %-24s = %s\n" "$attr" "$(cat "$d/$attr" 2>/dev/null)"
+        done
+      done
+    } > "$TMPDIR/storage/sysfs-block-attributes.txt" 2>&1
+  fi
+
+  # /dev/disk/by-* symlink inventory — canonical for UUID / PARTUUID / LABEL /
+  # PATH / ID lookups. Read-only listing.
+  if [ -d /dev/disk ]; then
+    ls -laR /dev/disk > "$TMPDIR/storage/dev-disk-tree.txt" 2>&1
+  fi
+
+  # Device-mapper tree — LVM, multipath, dm-crypt topology. Read-only.
+  if command -v dmsetup >/dev/null 2>&1; then
+    dmsetup ls --tree > "$TMPDIR/storage/dmsetup-tree.txt" 2>&1
+    dmsetup info > "$TMPDIR/storage/dmsetup-info.txt" 2>&1
+  fi
+
+  # NVMe native-multipath subsystem enumeration (stylus/pkg/disk treats
+  # /sys/devices/virtual/nvme-subsystem/* as real disks — worth capturing).
+  if [ -d /sys/class/nvme-subsystem ]; then
+    ls -laR /sys/class/nvme-subsystem > "$TMPDIR/storage/nvme-subsystem-tree.txt" 2>&1
+  fi
 }
 
 function gpu-info() {
