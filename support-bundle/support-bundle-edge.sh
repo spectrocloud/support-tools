@@ -476,21 +476,23 @@ function storage-info() {
     lvs > "$TMPDIR/storage/lvs.txt" 2>&1
   fi
 
-  # NVMe inventory + SMART health (per-drive)
+  # NVMe inventory + SMART health (per-drive). timeout guards against a
+  # wedged controller returning slowly or hanging.
   if command -v nvme >/dev/null 2>&1; then
-    nvme list > "$TMPDIR/storage/nvme-list.txt" 2>&1
+    timeout 15 nvme list > "$TMPDIR/storage/nvme-list.txt" 2>&1 || echo "(nvme list timed out or failed)" >> "$TMPDIR/storage/nvme-list.txt"
     for dev in /dev/nvme[0-9]*n[0-9]*; do
       [ -b "$dev" ] || continue
       name=$(basename "$dev")
-      nvme id-ctrl "$dev" > "$TMPDIR/storage/nvme-idctrl-${name}.txt" 2>&1 || true
-      nvme smart-log "$dev" > "$TMPDIR/storage/nvme-smart-${name}.txt" 2>&1 || true
+      timeout 10 nvme id-ctrl "$dev" > "$TMPDIR/storage/nvme-idctrl-${name}.txt" 2>&1 || true
+      timeout 10 nvme smart-log "$dev" > "$TMPDIR/storage/nvme-smart-${name}.txt" 2>&1 || true
     done
   fi
   if command -v smartctl >/dev/null 2>&1; then
     for dev in /dev/nvme[0-9]*n[0-9]* /dev/sd? /dev/nvme[0-9]*; do
       [ -b "$dev" ] || continue
       name=$(basename "$dev")
-      smartctl -a "$dev" > "$TMPDIR/storage/smartctl-${name}.txt" 2>&1 || true
+      # smartctl on a failing drive can wait tens of seconds per query.
+      timeout 20 smartctl -a "$dev" > "$TMPDIR/storage/smartctl-${name}.txt" 2>&1 || true
     done
   fi
 
@@ -609,27 +611,20 @@ function gpu-info() {
       rocm-smi -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1
       rocm-smi --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1
     elif kubectl version >/dev/null 2>&1; then
-      # Try any pod in amd-gpu-operator that has rocm-smi. Device-plugin/metrics
-      # containers usually don't; try common candidates.
-      for CAND in $(kubectl -n amd-gpu-operator get pods -o name 2>/dev/null); do
-        if kubectl -n amd-gpu-operator exec "$CAND" -- which rocm-smi >/dev/null 2>&1; then
-          techo "Collecting rocm-smi via $CAND"
-          kubectl -n amd-gpu-operator exec "$CAND" -- rocm-smi -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1
-          kubectl -n amd-gpu-operator exec "$CAND" -- rocm-smi --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1
-          break
-        fi
-      done
-      # If still no rocm-smi output, try any running vLLM/inference pod in launchpad-ai
-      if [ ! -f "$TMPDIR/gpu/amd/rocm-smi-all.txt" ]; then
-        for CAND in $(kubectl -n launchpad-ai get pods --field-selector=status.phase=Running -o name 2>/dev/null | grep -iE "vllm|engine"); do
-          if kubectl -n launchpad-ai exec "$CAND" -- which rocm-smi >/dev/null 2>&1; then
-            techo "Collecting rocm-smi via $CAND"
-            kubectl -n launchpad-ai exec "$CAND" -- rocm-smi -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1
-            kubectl -n launchpad-ai exec "$CAND" -- rocm-smi --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1
-            break
+      # rocm-smi lives inside GPU-workload containers, not on Kairos hosts.
+      # Try any pod in amd-gpu-operator, then any running vLLM/engine pod in
+      # launchpad-ai. All kubectl exec calls are timeout-guarded to avoid
+      # blocking the bundle if a pod is unresponsive.
+      for NS in amd-gpu-operator launchpad-ai; do
+        for CAND in $(timeout 10 kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
+          if timeout 10 kubectl -n "$NS" exec "$CAND" -- which rocm-smi >/dev/null 2>&1; then
+            techo "Collecting rocm-smi via $NS/$CAND"
+            timeout 30 kubectl -n "$NS" exec "$CAND" -- rocm-smi -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1 || echo "(rocm-smi -a via kubectl timed out or failed)" >> "$TMPDIR/gpu/amd/rocm-smi-all.txt"
+            timeout 30 kubectl -n "$NS" exec "$CAND" -- rocm-smi --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1 || echo "(rocm-smi --show* via kubectl timed out or failed)" >> "$TMPDIR/gpu/amd/rocm-smi-detail.txt"
+            break 2
           fi
         done
-      fi
+      done
     fi
 
     # devcoredumps (preserved by /oem udev rule — see launchpad-ai PRs #512, #530)
@@ -656,29 +651,30 @@ function gpu-info() {
     fi
 
     if command -v nvidia-smi >/dev/null 2>&1; then
-      nvidia-smi -q > "$TMPDIR/gpu/nvidia/nvidia-smi-query.txt" 2>&1
-      nvidia-smi > "$TMPDIR/gpu/nvidia/nvidia-smi.txt" 2>&1
-      nvidia-smi topo -m > "$TMPDIR/gpu/nvidia/nvidia-smi-topo.txt" 2>&1
-      nvidia-smi --query-gpu=index,name,pci.bus_id,vbios_version,driver_version,pstate,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.used,ecc.errors.corrected.aggregate.total,ecc.errors.uncorrected.aggregate.total --format=csv > "$TMPDIR/gpu/nvidia/nvidia-smi-summary.csv" 2>&1
+      timeout 20 nvidia-smi -q > "$TMPDIR/gpu/nvidia/nvidia-smi-query.txt" 2>&1 || echo "(nvidia-smi -q timed out or failed)" >> "$TMPDIR/gpu/nvidia/nvidia-smi-query.txt"
+      timeout 10 nvidia-smi > "$TMPDIR/gpu/nvidia/nvidia-smi.txt" 2>&1 || true
+      timeout 15 nvidia-smi topo -m > "$TMPDIR/gpu/nvidia/nvidia-smi-topo.txt" 2>&1 || true
+      timeout 15 nvidia-smi --query-gpu=index,name,pci.bus_id,vbios_version,driver_version,pstate,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.used,ecc.errors.corrected.aggregate.total,ecc.errors.uncorrected.aggregate.total --format=csv > "$TMPDIR/gpu/nvidia/nvidia-smi-summary.csv" 2>&1 || true
     elif kubectl version >/dev/null 2>&1; then
       # Try NVIDIA GPU operator's driver/validator pod, then any running vLLM
       for NS in gpu-operator launchpad-ai; do
-        for CAND in $(kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
-          if kubectl -n "$NS" exec "$CAND" -- which nvidia-smi >/dev/null 2>&1; then
+        for CAND in $(timeout 10 kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
+          if timeout 10 kubectl -n "$NS" exec "$CAND" -- which nvidia-smi >/dev/null 2>&1; then
             techo "Collecting nvidia-smi via $NS/$CAND"
-            kubectl -n "$NS" exec "$CAND" -- nvidia-smi -q > "$TMPDIR/gpu/nvidia/nvidia-smi-query.txt" 2>&1
-            kubectl -n "$NS" exec "$CAND" -- nvidia-smi topo -m > "$TMPDIR/gpu/nvidia/nvidia-smi-topo.txt" 2>&1
+            timeout 30 kubectl -n "$NS" exec "$CAND" -- nvidia-smi -q > "$TMPDIR/gpu/nvidia/nvidia-smi-query.txt" 2>&1 || true
+            timeout 20 kubectl -n "$NS" exec "$CAND" -- nvidia-smi topo -m > "$TMPDIR/gpu/nvidia/nvidia-smi-topo.txt" 2>&1 || true
             break 2
           fi
         done
       done
     fi
 
-    # nvidia-bug-report.sh — if the driver package installed it, it produces a
-    # comprehensive dump on its own. Runs to a fixed path; we then move it.
+    # nvidia-bug-report.sh — if the driver package installed it, it produces
+    # a comprehensive dump on its own. Can take ~60s on a healthy system,
+    # longer on a wedged one. Hard-cap at 3 min so it can't block the bundle.
     if command -v nvidia-bug-report.sh >/dev/null 2>&1; then
-      techo "Running nvidia-bug-report.sh (may take a minute)"
-      (cd "$TMPDIR/gpu/nvidia" && nvidia-bug-report.sh --output-file nvidia-bug-report.log.gz >/dev/null 2>&1) || true
+      techo "Running nvidia-bug-report.sh (bounded at 180s)"
+      timeout 180 sh -c "cd '$TMPDIR/gpu/nvidia' && nvidia-bug-report.sh --output-file nvidia-bug-report.log.gz" >/dev/null 2>&1 || echo "(nvidia-bug-report.sh timed out or failed — check nvidia-smi output above instead)" > "$TMPDIR/gpu/nvidia/nvidia-bug-report-status"
     fi
 
     if [ -d /var/log/nvidia-devcoredump ]; then
