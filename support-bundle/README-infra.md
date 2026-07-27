@@ -151,6 +151,7 @@ For Enterprise and PCG clusters, the script collects MongoDB replica set informa
 * `rs-conf.json`: Replica set configuration including member settings and priorities
 * `replication-info.txt`: Oplog information and replication window
 * `disk-usage.txt`: Actual `df -h /var/lib/mongodb` per mongo pod — the real on-disk size, which can differ from the requested PVC/PV size on thin-provisioned or fixed-disk-offering backends (e.g. CloudStack fixed offerings)
+* `db-collection-sizes.txt`: Per-database and per-collection storage/data sizes (MB) and document counts — shows which collections are consuming disk
 
 ## Important Notes
 
