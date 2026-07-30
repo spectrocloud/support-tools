@@ -199,6 +199,53 @@ Output that is collected from the cluster. Note that pod logs from other nodes a
 * Edge-specific custom resources
 * Edge networking configuration
 
+### Storage / LVM / NVMe Collection
+
+Palette edge hosts run on LVM (`spectro-data-vg` / `spectro-data-lv` with the persistent partition at `/opt`), and AI appliances additionally park model weights under `/opt/data/spectrocloud/models/` (hundreds of GB per model). Storage health is load-bearing for triage. The `storage-info` step collects:
+
+* `lsblk -f` (filesystem labels/UUIDs/mountpoints) and detailed `lsblk` with model/serial/transport/rotational
+* `df -h` and `df -i` (filesystem + inode usage)
+* `/proc/mounts` and `/etc/fstab`
+* `fdisk -l` (partition tables) — when available
+* LVM: `pvdisplay`, `vgdisplay`, `lvdisplay` and their compact counterparts `pvs` / `vgs` / `lvs` — when LVM tools are installed
+* NVMe: `nvme list`, `nvme id-ctrl`, `nvme smart-log` per drive — when `nvme-cli` is installed
+* SMART: `smartctl -a` per block device — when `smartmontools` is installed
+
+Silently skips per-tool blocks when the binary isn't present, so this is safe on any host.
+
+### AI / GPU Collection (launchpad-ai appliances)
+
+For AI-inference appliances (`launchpad-ai`) and other GPU-bearing edge nodes, the script collects vendor-specific GPU state alongside the standard Kubernetes and system collection. Emits an empty `gpu/` directory on non-GPU hosts — safe to run everywhere.
+
+#### Namespaces included by default
+The `launchpad-ai`, `amd-gpu-operator`, and `gpu-operator` namespaces are collected without needing `-n`. This covers the gateway, local-models-scanner, semantic router, UI, engine (vLLM) pods and their previous-instance logs, plus AMD/NVIDIA operator components.
+
+#### Custom resources
+All `launchpad.spectrocloud.com/v1alpha1` CRs are collected via the generic CRD walk — `models`, `launchpadconfigs`, `modelgroupquotas`, `modelgroupapikeys`, `quotasettings`. Also the on-node `launchpad-local-models-edge-<node-id>` ConfigMap (source-of-truth for the reconcile loop).
+
+#### AMD (amdgpu / ROCm) — collected when `/sys/module/amdgpu` exists
+* Driver: `/sys/module/amdgpu/version`, full `modinfo amdgpu`, all `/sys/module/amdgpu/parameters/*` values (lockup_timeout, reset_method, gpu_recovery, etc.)
+* Per-card VBIOS via `/sys/bus/pci/devices/*/vbios_version`
+* Per-card firmware components via `/sys/bus/pci/devices/*/fw_version/*` (sdma_fw_version, sos_fw_version, smc_fw_version, ta_xgmi_fw_version, mec_fw_version, rlc_fw_version, etc.) — heterogeneous firmware across cards is a documented failure mode
+* Per-card RAS state and ECC error counters via `/sys/bus/pci/devices/*/ras/*`
+* Per-card temperature / power / voltage / fan via sysfs `hwmon`
+* `rocm-smi -a` and `rocm-smi --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios` — sourced from the host if `rocm-smi` is installed, else via `kubectl exec` into any pod in `amd-gpu-operator` or `launchpad-ai` that has the tool
+* AMD GPU device coredumps from `/var/log/amdgpu-devcoredump/` (populated by the udev rule shipped in the AMD OS profile — the ONLY forensic evidence available for post-mortem RCA of SDMA/GFX/KIQ ring hangs, since kernel devcoredumps are otherwise freed on read/timeout/reboot)
+* Live sysfs devcoredump listing (`/sys/class/devcoredump/`)
+
+#### NVIDIA (nvidia driver) — collected when `/proc/driver/nvidia` exists or `nvidia-smi` is present
+* Driver version from `/proc/driver/nvidia/version`
+* `nvidia-smi -q` (full attribute dump), `nvidia-smi topo -m` (NVLink/PCIe topology), plus a compact CSV summary of per-GPU state (pstate, temp, util, memory, ECC corrected + uncorrected counts) — sourced from the host if `nvidia-smi` is installed, else via `kubectl exec` into any running pod in `gpu-operator` or `launchpad-ai`
+* `nvidia-bug-report.sh` output if the tool is installed (comprehensive vendor-side dump)
+* NVIDIA GPU device coredumps from `/var/log/nvidia-devcoredump/` (populated by the udev rule shipped in the NVIDIA OS profile)
+
+#### launchpad-ai on-disk state
+* Directory shape (not contents) of `/opt/data/spectrocloud/models/` — weights are hundreds of GB and are never copied into the bundle
+* `metadata.yaml` files for every locally-installed model (small, ~20 KB each) — these declare the exact recipe used to launch each engine (image, TP width, quantization, extra_args, env vars). Essential context for engine-crash triage.
+
+#### Kernel evidence (previous boot)
+* `dmesg-previous-boot` and `journalctl-previous-boot` — full kernel log from the boot BEFORE this one. Present only when journald has persistent storage (`/var/log/journal/` populated). Critical for post-crash forensics: if a GPU wedge caused the host to lose networking and reboot, the surviving evidence is here.
+
 ### MongoDB Collection (Enterprise Clusters Only)
 
 For Enterprise and PCG clusters, the script collects MongoDB replica set information:

@@ -36,7 +36,7 @@ JOURNALD_LOGS=(
   cos-setup-boot
   )
 
-SYSTEM_NAMESPACES=(capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default harbor konveyor-forklift kube-system kube-public kubernetes-dashboard kubevirt longhorn-system os-patch palette-system piraeus-system reach-system rook-ceph spectro-system spectro-task system-upgrade vm-dashboard zot-system)
+SYSTEM_NAMESPACES=(amd-gpu-operator capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default gpu-operator grafana harbor headlamp keycloak konveyor-forklift kube-system kube-public kubernetes-dashboard kubevirt launchpad-ai longhorn-system metallb-system os-patch palette-system piraeus-system reach-system rook-ceph spectro-system spectro-task system-upgrade traefik victoria-metrics vm-dashboard zot-system)
 
 API_RESOURCES=(apiservices clusterroles clusterrolebindings crds csr mutatingwebhookconfigurations namespaces nodes priorityclasses pv storageclasses validatingwebhookconfigurations volumeattachments)
 
@@ -308,6 +308,14 @@ function sherlock() {
   if (command -v kubeadm > /dev/null 2>&1); then
     DISTRO="kubeadm"
     agent-mode-kubeadm-setup
+     if [ -z "${CRI_CONFIG_FILE}" ] && [ -z "${CONTAINER_RUNTIME_ENDPOINT}" ] \
+       && [ ! -f /etc/crictl.yaml ] && [ -S /run/containerd/containerd.sock ]; then
+      cat > "${TMPDIR}/crictl.yaml" <<EOF
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+EOF
+      export CRI_CONFIG_FILE="${TMPDIR}/crictl.yaml"
+    fi
   elif (command -v k3s > /dev/null 2>&1); then
     if k3s crictl ps >/dev/null 2>&1; then
         DISTRO="k3s"
@@ -418,6 +426,16 @@ function journald-log() {
   journalctl --no-pager -k $JOURNALD_FLAGS >"$TMPDIR/journald/dmesg"
   journalctl --no-pager --list-boot $JOURNALD_FLAGS >"$TMPDIR/journald/journal-boot"
 
+  # Previous boot's kernel log — critical for post-crash forensics (GPU wedges,
+  # PCIe faults, kernel panics that force a reboot). Only present when
+  # journald has persistent storage enabled (Storage=persistent, /var/log/journal
+  # populated). Empty file on volatile systems is normal.
+  if [ -d /var/log/journal ] && journalctl --list-boots --no-pager 2>/dev/null | awk '{print $1}' | grep -q '^-1$'; then
+    techo "Collecting kernel log from previous boot (post-crash forensics)"
+    journalctl --no-pager -b -1 -k >"$TMPDIR/journald/dmesg-previous-boot" 2>&1
+    journalctl --no-pager -b -1 >"$TMPDIR/journald/journalctl-previous-boot" 2>&1
+  fi
+
   for JOURNALD_LOG in "${JOURNALD_LOGS[@]}"; do
     if systemctl list-units --full -all | grep -Fq "$JOURNALD_LOG.service"; then
       techo "Collecting logs for $JOURNALD_LOG"
@@ -426,6 +444,300 @@ function journald-log() {
   done
 
   journalctl --no-pager $JOURNALD_FLAGS >"$TMPDIR/journald/journalctl"
+}
+
+function storage-info() {
+  # Collect host storage state — block devices, filesystems, LVM, NVMe.
+  # Palette edge hosts run on LVM (spectro-data-vg / spectro-data-lv) with
+  # the persistent partition at /opt; AI appliances additionally park model
+  # weights under /opt/data/spectrocloud/models/ (hundreds of GB), so LVM
+  # health and NVMe state are load-bearing for troubleshooting.
+  techo "Collecting storage info"
+  mkdir -p "$TMPDIR/storage"
+
+  # Block devices + filesystems
+  if command -v lsblk >/dev/null 2>&1; then
+    lsblk -f > "$TMPDIR/storage/lsblk-f.txt" 2>&1
+    lsblk -o NAME,SIZE,TYPE,MOUNTPOINTS,FSTYPE,LABEL,UUID,MODEL,SERIAL,TRAN,ROTA,STATE > "$TMPDIR/storage/lsblk-detail.txt" 2>&1
+  fi
+
+  # Filesystem usage
+  df -h > "$TMPDIR/storage/df-h.txt" 2>&1
+  df -i > "$TMPDIR/storage/df-i.txt" 2>&1
+
+  # Mount state
+  cat /proc/mounts > "$TMPDIR/storage/proc-mounts" 2>&1
+  [ -f /etc/fstab ] && cp -p /etc/fstab "$TMPDIR/storage/etc-fstab" 2>&1
+
+  # Partition tables
+  if command -v fdisk >/dev/null 2>&1; then
+    fdisk -l > "$TMPDIR/storage/fdisk-l.txt" 2>&1
+  fi
+
+  # LVM (Palette persistent partition is LVM-backed by default)
+  if command -v pvdisplay >/dev/null 2>&1; then
+    pvdisplay > "$TMPDIR/storage/pvdisplay.txt" 2>&1
+    vgdisplay > "$TMPDIR/storage/vgdisplay.txt" 2>&1
+    lvdisplay > "$TMPDIR/storage/lvdisplay.txt" 2>&1
+    pvs > "$TMPDIR/storage/pvs.txt" 2>&1
+    vgs > "$TMPDIR/storage/vgs.txt" 2>&1
+    lvs > "$TMPDIR/storage/lvs.txt" 2>&1
+  fi
+
+  # NVMe inventory + SMART health (per-drive). timeout guards against a
+  # wedged controller returning slowly or hanging.
+  if command -v nvme >/dev/null 2>&1; then
+    timeout 15 nvme list > "$TMPDIR/storage/nvme-list.txt" 2>&1 || echo "(nvme list timed out or failed)" >> "$TMPDIR/storage/nvme-list.txt"
+    for dev in /dev/nvme[0-9]*n[0-9]*; do
+      [ -b "$dev" ] || continue
+      name=$(basename "$dev")
+      timeout 10 nvme id-ctrl "$dev" > "$TMPDIR/storage/nvme-idctrl-${name}.txt" 2>&1 || true
+      timeout 10 nvme smart-log "$dev" > "$TMPDIR/storage/nvme-smart-${name}.txt" 2>&1 || true
+    done
+  fi
+  if command -v smartctl >/dev/null 2>&1; then
+    for dev in /dev/nvme[0-9]*n[0-9]* /dev/sd? /dev/nvme[0-9]*; do
+      [ -b "$dev" ] || continue
+      name=$(basename "$dev")
+      # smartctl on a failing drive can wait tens of seconds per query.
+      timeout 20 smartctl -a "$dev" > "$TMPDIR/storage/smartctl-${name}.txt" 2>&1 || true
+    done
+  fi
+
+  # sysfs block device attributes — mirrors what stylus/pkg/disk reads for
+  # disk enumeration (dm UUIDs for LVM/dm-crypt/multipath, rotational flag
+  # for SSD vs HDD, hidden flag, raw size). All read-only sysfs paths.
+  if [ -d /sys/block ]; then
+    {
+      for d in /sys/block/*; do
+        [ -d "$d" ] || continue
+        name=$(basename "$d")
+        printf "=== %s ===\n" "$name"
+        for attr in size hidden removable ro queue/rotational queue/scheduler dm/name dm/uuid device/model device/vendor device/serial; do
+          [ -r "$d/$attr" ] && printf "  %-24s = %s\n" "$attr" "$(cat "$d/$attr" 2>/dev/null)"
+        done
+      done
+    } > "$TMPDIR/storage/sysfs-block-attributes.txt" 2>&1
+  fi
+
+  # /dev/disk/by-* symlink inventory — canonical for UUID / PARTUUID / LABEL /
+  # PATH / ID lookups. Read-only listing.
+  if [ -d /dev/disk ]; then
+    ls -laR /dev/disk > "$TMPDIR/storage/dev-disk-tree.txt" 2>&1
+  fi
+
+  # Device-mapper tree — LVM, multipath, dm-crypt topology. Read-only.
+  if command -v dmsetup >/dev/null 2>&1; then
+    dmsetup ls --tree > "$TMPDIR/storage/dmsetup-tree.txt" 2>&1
+    dmsetup info > "$TMPDIR/storage/dmsetup-info.txt" 2>&1
+  fi
+
+  # NVMe native-multipath subsystem enumeration (stylus/pkg/disk treats
+  # /sys/devices/virtual/nvme-subsystem/* as real disks — worth capturing).
+  if [ -d /sys/class/nvme-subsystem ]; then
+    ls -laR /sys/class/nvme-subsystem > "$TMPDIR/storage/nvme-subsystem-tree.txt" 2>&1
+  fi
+}
+
+function gpu-info() {
+  # Collect GPU host state for AI/inference appliances (launchpad-ai and other
+  # GPU-bearing edge nodes). Emits an empty gpu/ directory on nodes with no
+  # GPU — safe on non-GPU hosts.
+  techo "Collecting GPU info (AMD + NVIDIA)"
+  mkdir -p "$TMPDIR/gpu"
+
+  # PCI enumeration — always available, tells us what GPUs are present even
+  # when vendor tooling isn't installed on the host.
+  if command -v lspci >/dev/null 2>&1; then
+    lspci -nn 2>/dev/null | grep -iE "vga|3d|display|nvidia|amd/ati|amd inst|advanced micro" > "$TMPDIR/gpu/lspci-gpu.txt" 2>&1
+    lspci -tv > "$TMPDIR/gpu/lspci-tree.txt" 2>&1
+  fi
+
+  # --- AMD (amdgpu, ROCm) ---
+  # Kairos/Palette edge hosts are minimal and typically do NOT have rocm-smi
+  # on the host — the tool ships inside GPU-workload containers. We prefer
+  # sysfs (always available) and fall back to running rocm-smi via kubectl
+  # exec if the amdgpu operator's device-plugin pod exists.
+  if [ -d /sys/module/amdgpu ]; then
+    techo "Collecting AMD GPU info"
+    mkdir -p "$TMPDIR/gpu/amd"
+
+    # Driver version
+    cat /sys/module/amdgpu/version > "$TMPDIR/gpu/amd/amdgpu-module-version" 2>&1
+    modinfo amdgpu > "$TMPDIR/gpu/amd/amdgpu-modinfo" 2>&1
+
+    # Module parameters (lockup_timeout, reset_method, gpu_recovery, etc.)
+    for p in /sys/module/amdgpu/parameters/*; do
+      [ -r "$p" ] && printf "%s = %s\n" "$(basename "$p")" "$(cat "$p" 2>/dev/null)"
+    done > "$TMPDIR/gpu/amd/amdgpu-parameters" 2>&1
+
+    # Per-card VBIOS + firmware component versions from sysfs
+    for pcidir in /sys/bus/pci/devices/*/vbios_version; do
+      [ -f "$pcidir" ] || continue
+      pci=$(basename "$(dirname "$pcidir")")
+      printf "%s  VBIOS=%s\n" "$pci" "$(cat "$pcidir")" >> "$TMPDIR/gpu/amd/amdgpu-vbios-versions"
+    done 2>/dev/null
+    for fwdir in /sys/bus/pci/devices/*/fw_version; do
+      [ -d "$fwdir" ] || continue
+      pci=$(basename "$(dirname "$fwdir")")
+      {
+        echo "=== $pci ==="
+        for f in "$fwdir"/*; do
+          [ -r "$f" ] && printf "  %-20s = %s\n" "$(basename "$f")" "$(cat "$f" 2>/dev/null)"
+        done
+      } >> "$TMPDIR/gpu/amd/amdgpu-firmware-versions"
+    done 2>/dev/null
+
+    # RAS state per card (bad-page counts, ECC counters)
+    for rasdir in /sys/bus/pci/devices/*/ras; do
+      [ -d "$rasdir" ] || continue
+      pci=$(basename "$(dirname "$rasdir")")
+      {
+        echo "=== $pci ==="
+        for f in "$rasdir"/*_err_count "$rasdir"/features "$rasdir"/gpu_vram_bad_pages_count; do
+          [ -r "$f" ] && printf "  %-30s = %s\n" "$(basename "$f")" "$(cat "$f" 2>/dev/null)"
+        done
+      } >> "$TMPDIR/gpu/amd/amdgpu-ras-state"
+    done 2>/dev/null
+
+    # Per-card temperature/utilization from hwmon
+    for hwmondir in /sys/bus/pci/devices/*/hwmon/hwmon*; do
+      [ -d "$hwmondir" ] || continue
+      pci=$(basename "$(dirname "$(dirname "$hwmondir")")")
+      {
+        echo "=== $pci ==="
+        for f in "$hwmondir"/temp*_input "$hwmondir"/temp*_label \
+                 "$hwmondir"/power*_average "$hwmondir"/power*_cap \
+                 "$hwmondir"/in*_input "$hwmondir"/fan*_input; do
+          [ -r "$f" ] && printf "  %-20s = %s\n" "$(basename "$f")" "$(cat "$f" 2>/dev/null)"
+        done
+      } >> "$TMPDIR/gpu/amd/amdgpu-hwmon"
+    done 2>/dev/null
+
+    # rocm-smi output (prefer host binary; fall back to any AMD GPU operator pod)
+    if command -v rocm-smi >/dev/null 2>&1; then
+      rocm-smi -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1
+      rocm-smi --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1
+    elif kubectl version >/dev/null 2>&1; then
+      # rocm-smi lives inside GPU-workload containers, not on Kairos hosts.
+      # Try any pod in amd-gpu-operator, then any running vLLM/engine pod in
+      # launchpad-ai. All kubectl exec calls are timeout-guarded to avoid
+      # blocking the bundle if a pod is unresponsive.
+      for NS in amd-gpu-operator launchpad-ai; do
+        for CAND in $(timeout 10 kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
+          if timeout 10 kubectl -n "$NS" exec "$CAND" -- which rocm-smi >/dev/null 2>&1; then
+            techo "Collecting rocm-smi via $NS/$CAND"
+            timeout 30 kubectl -n "$NS" exec "$CAND" -- rocm-smi -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1 || echo "(rocm-smi -a via kubectl timed out or failed)" >> "$TMPDIR/gpu/amd/rocm-smi-all.txt"
+            timeout 30 kubectl -n "$NS" exec "$CAND" -- rocm-smi --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1 || echo "(rocm-smi --show* via kubectl timed out or failed)" >> "$TMPDIR/gpu/amd/rocm-smi-detail.txt"
+            break 2
+          fi
+        done
+      done
+    fi
+
+    # devcoredumps (preserved by /oem udev rule — see launchpad-ai PRs #512, #530)
+    if [ -d /var/log/amdgpu-devcoredump ]; then
+      techo "Collecting AMD GPU devcoredumps"
+      mkdir -p "$TMPDIR/gpu/amd/devcoredump"
+      cp -p /var/log/amdgpu-devcoredump/*.bin "$TMPDIR/gpu/amd/devcoredump/" 2>/dev/null || true
+      ls -la /var/log/amdgpu-devcoredump/ > "$TMPDIR/gpu/amd/devcoredump/listing" 2>&1
+    fi
+
+    # Any live devcoredumps still sitting in /sys (not yet freed by kernel)
+    if [ -d /sys/class/devcoredump ]; then
+      ls -la /sys/class/devcoredump/ > "$TMPDIR/gpu/amd/sys-devcoredump-listing" 2>&1
+    fi
+  fi
+
+  # --- NVIDIA (nvidia driver) ---
+  if [ -e /proc/driver/nvidia ] || command -v nvidia-smi >/dev/null 2>&1; then
+    techo "Collecting NVIDIA GPU info"
+    mkdir -p "$TMPDIR/gpu/nvidia"
+
+    if [ -e /proc/driver/nvidia/version ]; then
+      cat /proc/driver/nvidia/version > "$TMPDIR/gpu/nvidia/driver-version" 2>&1
+    fi
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      timeout 20 nvidia-smi -q > "$TMPDIR/gpu/nvidia/nvidia-smi-query.txt" 2>&1 || echo "(nvidia-smi -q timed out or failed)" >> "$TMPDIR/gpu/nvidia/nvidia-smi-query.txt"
+      timeout 10 nvidia-smi > "$TMPDIR/gpu/nvidia/nvidia-smi.txt" 2>&1 || true
+      timeout 15 nvidia-smi topo -m > "$TMPDIR/gpu/nvidia/nvidia-smi-topo.txt" 2>&1 || true
+      timeout 15 nvidia-smi --query-gpu=index,name,pci.bus_id,vbios_version,driver_version,pstate,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.used,ecc.errors.corrected.aggregate.total,ecc.errors.uncorrected.aggregate.total --format=csv > "$TMPDIR/gpu/nvidia/nvidia-smi-summary.csv" 2>&1 || true
+    elif kubectl version >/dev/null 2>&1; then
+      # Try NVIDIA GPU operator's driver/validator pod, then any running vLLM
+      for NS in gpu-operator launchpad-ai; do
+        for CAND in $(timeout 10 kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
+          if timeout 10 kubectl -n "$NS" exec "$CAND" -- which nvidia-smi >/dev/null 2>&1; then
+            techo "Collecting nvidia-smi via $NS/$CAND"
+            timeout 30 kubectl -n "$NS" exec "$CAND" -- nvidia-smi -q > "$TMPDIR/gpu/nvidia/nvidia-smi-query.txt" 2>&1 || true
+            timeout 20 kubectl -n "$NS" exec "$CAND" -- nvidia-smi topo -m > "$TMPDIR/gpu/nvidia/nvidia-smi-topo.txt" 2>&1 || true
+            break 2
+          fi
+        done
+      done
+    fi
+
+    # nvidia-bug-report.sh — NVIDIA driver's built-in diagnostic collector.
+    # Ships in the nvidia-utils/driver package. On Palette NVIDIA appliances
+    # the driver + userspace tools live inside the GPU Operator's driver
+    # DaemonSet container, NOT on the host (Kairos is minimal). So: try the
+    # host binary first, then fall back to kubectl exec into any pod in
+    # gpu-operator or launchpad-ai that has the tool.
+    # Read-only from a system perspective (only writes to its output file);
+    # hard 180s cap because it can hang on a wedged GPU.
+    NVIDIA_BUG_REPORT_CAPTURED=0
+    if command -v nvidia-bug-report.sh >/dev/null 2>&1; then
+      techo "Running nvidia-bug-report.sh on host (bounded at 180s)"
+      if timeout 180 sh -c "cd '$TMPDIR/gpu/nvidia' && nvidia-bug-report.sh --output-file nvidia-bug-report.log.gz" >/dev/null 2>&1; then
+        NVIDIA_BUG_REPORT_CAPTURED=1
+      fi
+    fi
+    if [ "$NVIDIA_BUG_REPORT_CAPTURED" = "0" ] && kubectl version >/dev/null 2>&1; then
+      # Fallback: exec inside any driver / validator / vLLM pod that ships
+      # the tool. Stream the .gz back over stdout so we don't need kubectl cp
+      # or an in-pod cleanup step.
+      for NS in gpu-operator launchpad-ai; do
+        for CAND in $(timeout 10 kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
+          if timeout 10 kubectl -n "$NS" exec "$CAND" -- sh -c 'command -v nvidia-bug-report.sh' >/dev/null 2>&1; then
+            techo "Running nvidia-bug-report.sh via $NS/$CAND (bounded at 180s)"
+            if timeout 180 kubectl -n "$NS" exec "$CAND" -- sh -c 'nvidia-bug-report.sh --output-file /tmp/nvidia-bug-report-sb.log.gz >/dev/null 2>&1 && cat /tmp/nvidia-bug-report-sb.log.gz && rm -f /tmp/nvidia-bug-report-sb.log.gz' > "$TMPDIR/gpu/nvidia/nvidia-bug-report.log.gz" 2>/dev/null; then
+              # Sanity check: empty file = something went wrong
+              if [ -s "$TMPDIR/gpu/nvidia/nvidia-bug-report.log.gz" ]; then
+                NVIDIA_BUG_REPORT_CAPTURED=1
+                break 2
+              fi
+            fi
+          fi
+        done
+      done
+    fi
+    if [ "$NVIDIA_BUG_REPORT_CAPTURED" = "0" ]; then
+      echo "nvidia-bug-report.sh not found on host or in any candidate pod (gpu-operator/launchpad-ai). Check nvidia-smi output in this dir instead." > "$TMPDIR/gpu/nvidia/nvidia-bug-report-status"
+    fi
+
+    if [ -d /var/log/nvidia-devcoredump ]; then
+      techo "Collecting NVIDIA GPU devcoredumps"
+      mkdir -p "$TMPDIR/gpu/nvidia/devcoredump"
+      cp -p /var/log/nvidia-devcoredump/*.bin "$TMPDIR/gpu/nvidia/devcoredump/" 2>/dev/null || true
+      ls -la /var/log/nvidia-devcoredump/ > "$TMPDIR/gpu/nvidia/devcoredump/listing" 2>&1
+    fi
+  fi
+
+  # --- launchpad-ai on-disk state ---
+  # Local models directory shape (do NOT copy weights — potentially hundreds of GB)
+  if [ -d /opt/data/spectrocloud/models ]; then
+    techo "Collecting launchpad-ai local models directory shape"
+    mkdir -p "$TMPDIR/gpu/launchpad-ai"
+    ls -la /opt/data/spectrocloud/models/ > "$TMPDIR/gpu/launchpad-ai/models-dir-listing" 2>&1
+    # metadata.yaml files are small (~20KB each) and describe every published
+    # variant + recipe — critical context for troubleshooting engine crashes.
+    find /opt/data/spectrocloud/models -maxdepth 3 -name metadata.yaml -type f 2>/dev/null | while read -r f; do
+      relpath=${f#/opt/data/spectrocloud/models/}
+      dest="$TMPDIR/gpu/launchpad-ai/models-metadata/$(dirname "$relpath")"
+      mkdir -p "$dest"
+      cp -p "$f" "$dest/" 2>/dev/null || true
+    done
+  fi
 }
 
 function system-info() {
@@ -1333,6 +1645,8 @@ chronyd-info
 networking-info
 var-log
 journald-log
+storage-info
+gpu-info
 
 stylus-files
 
