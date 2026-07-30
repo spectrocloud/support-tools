@@ -36,7 +36,7 @@ JOURNALD_LOGS=(
   cos-setup-boot
   )
 
-SYSTEM_NAMESPACES=(amd-gpu-operator capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default gpu-operator harbor konveyor-forklift kube-system kube-public kubernetes-dashboard kubevirt launchpad-ai longhorn-system os-patch palette-system piraeus-system reach-system rook-ceph spectro-system spectro-task system-upgrade vm-dashboard zot-system)
+SYSTEM_NAMESPACES=(amd-gpu-operator capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default gpu-operator grafana harbor headlamp keycloak konveyor-forklift kube-system kube-public kubernetes-dashboard kubevirt launchpad-ai longhorn-system metallb-system os-patch palette-system piraeus-system reach-system rook-ceph spectro-system spectro-task system-upgrade traefik victoria-metrics vm-dashboard zot-system)
 
 API_RESOURCES=(apiservices clusterroles clusterrolebindings crds csr mutatingwebhookconfigurations namespaces nodes priorityclasses pv storageclasses validatingwebhookconfigurations volumeattachments)
 
@@ -308,6 +308,14 @@ function sherlock() {
   if (command -v kubeadm > /dev/null 2>&1); then
     DISTRO="kubeadm"
     agent-mode-kubeadm-setup
+     if [ -z "${CRI_CONFIG_FILE}" ] && [ -z "${CONTAINER_RUNTIME_ENDPOINT}" ] \
+       && [ ! -f /etc/crictl.yaml ] && [ -S /run/containerd/containerd.sock ]; then
+      cat > "${TMPDIR}/crictl.yaml" <<EOF
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+EOF
+      export CRI_CONFIG_FILE="${TMPDIR}/crictl.yaml"
+    fi
   elif (command -v k3s > /dev/null 2>&1); then
     if k3s crictl ps >/dev/null 2>&1; then
         DISTRO="k3s"
