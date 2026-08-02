@@ -571,6 +571,14 @@ function gpu-info() {
       [ -r "$p" ] && printf "%s = %s\n" "$(basename "$p")" "$(cat "$p" 2>/dev/null)"
     done > "$TMPDIR/gpu/amd/amdgpu-parameters" 2>&1
 
+    # Kernel messages matching amdgpu / drm / pcieport — the primary signal
+    # for GPU driver panics, DRM subsystem faults, and PCIe link-training or
+    # AER errors that userspace tools (rocm-smi/amd-smi) won't surface.
+    if command -v dmesg >/dev/null 2>&1; then
+      dmesg -T 2>/dev/null | grep -iE "amdgpu|drm|pcieport" > "$TMPDIR/gpu/amd/amdgpu-dmesg.log" 2>&1 || \
+        dmesg | grep -iE "amdgpu|drm|pcieport" > "$TMPDIR/gpu/amd/amdgpu-dmesg.log" 2>&1 || true
+    fi
+
     # Per-card VBIOS + firmware component versions from sysfs
     for pcidir in /sys/bus/pci/devices/*/vbios_version; do
       [ -f "$pcidir" ] || continue
@@ -614,25 +622,107 @@ function gpu-info() {
       } >> "$TMPDIR/gpu/amd/amdgpu-hwmon"
     done 2>/dev/null
 
-    # rocm-smi output (prefer host binary; fall back to any AMD GPU operator pod)
-    if command -v rocm-smi >/dev/null 2>&1; then
-      rocm-smi -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1
-      rocm-smi --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1
-    elif kubectl version >/dev/null 2>&1; then
-      # rocm-smi lives inside GPU-workload containers, not on Kairos hosts.
-      # Try any pod in amd-gpu-operator, then any running vLLM/engine pod in
-      # launchpad-ai. All kubectl exec calls are timeout-guarded to avoid
-      # blocking the bundle if a pod is unresponsive.
+    # rocm-smi / amd-smi output (prefer host binary; fall back to any AMD GPU
+    # operator or workload pod). ROCm installs its tooling into a versioned
+    # directory like /opt/rocm-7.2.1/bin/ that is NOT on the default PATH, so
+    # `command -v rocm-smi` / `which amd-smi` can miss binaries that clearly
+    # exist. We discover them via a globbed lookup and invoke by absolute path.
+    # amd-smi is the newer replacement for rocm-smi and is preferred when both
+    # exist; we still capture rocm-smi output where available.
+    find-rocm-tool() {
+      # Usage: find-rocm-tool <tool-name>
+      # Echoes the first existing absolute path for the tool, or nothing.
+      # Search order: PATH, well-known ROCm install dirs, then a `find` sweep
+      # of /opt (ROCm ships under /opt/rocm-<version>/, which is NOT on the
+      # default PATH, so `which` misses it). We deliberately skip container
+      # rootfs paths (/run/containerd/.../rootfs, /opt/containerd/snapshots)
+      # here — those binaries need their container's mount namespace to run;
+      # they should be invoked via `kubectl exec` instead.
+      local tool="$1" p
+      if command -v "$tool" >/dev/null 2>&1; then
+        command -v "$tool"
+        return 0
+      fi
+      for p in /opt/rocm/bin/"$tool" /opt/rocm-*/bin/"$tool" /usr/local/bin/"$tool" /usr/bin/"$tool"; do
+        [ -x "$p" ] && { echo "$p"; return 0; }
+      done
+      if command -v find >/dev/null 2>&1; then
+        p=$(timeout 15 find /opt -maxdepth 4 -type f -name "$tool" -executable \
+              -not -path '/opt/containerd/*' 2>/dev/null | head -1)
+        [ -n "$p" ] && { echo "$p"; return 0; }
+      fi
+      return 1
+    }
+
+    find-rocm-tool-in-pod() {
+      # Usage: find-rocm-tool-in-pod <ns> <pod> <tool>
+      # Echoes the first existing absolute path for the tool inside the pod.
+      # Falls back to `find /opt /usr` — ROCm ships tools under versioned
+      # /opt/rocm-<ver>/bin/ that aren't on PATH inside the container either.
+      local ns="$1" pod="$2" tool="$3"
+      timeout 20 kubectl -n "$ns" exec "$pod" -- sh -c "
+        command -v $tool 2>/dev/null && exit 0
+        for p in /opt/rocm/bin/$tool /opt/rocm-*/bin/$tool /usr/local/bin/$tool /usr/bin/$tool; do
+          [ -x \"\$p\" ] && { echo \"\$p\"; exit 0; }
+        done
+        p=\$(find /opt /usr -maxdepth 5 -type f -name $tool -executable 2>/dev/null | head -1)
+        [ -n \"\$p\" ] && { echo \"\$p\"; exit 0; }
+        exit 1
+      " 2>/dev/null
+    }
+
+    ROCM_SMI_BIN="$(find-rocm-tool rocm-smi)"
+    AMD_SMI_BIN="$(find-rocm-tool amd-smi)"
+
+    if [ -n "$ROCM_SMI_BIN" ]; then
+      techo "Running rocm-smi on host: $ROCM_SMI_BIN"
+      timeout 30 "$ROCM_SMI_BIN" -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1 || true
+      timeout 30 "$ROCM_SMI_BIN" --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1 || true
+    fi
+    if [ -n "$AMD_SMI_BIN" ]; then
+      techo "Running amd-smi on host: $AMD_SMI_BIN"
+      timeout 30 "$AMD_SMI_BIN" version > "$TMPDIR/gpu/amd/amd-smi-version.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" list > "$TMPDIR/gpu/amd/amd-smi-list.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" static > "$TMPDIR/gpu/amd/amd-smi-static.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" metric > "$TMPDIR/gpu/amd/amd-smi-metric.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" firmware > "$TMPDIR/gpu/amd/amd-smi-firmware.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" bad-pages > "$TMPDIR/gpu/amd/amd-smi-bad-pages.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" topology > "$TMPDIR/gpu/amd/amd-smi-topology.txt" 2>&1 || true
+    fi
+
+    # If neither is on the host, try inside any candidate pod.
+    if [ -z "$ROCM_SMI_BIN" ] && [ -z "$AMD_SMI_BIN" ] && kubectl version >/dev/null 2>&1; then
+      # rocm-smi / amd-smi live inside GPU-workload containers, not on Kairos
+      # hosts. Try any pod in amd-gpu-operator, then any running vLLM/engine
+      # pod in launchpad-ai. All kubectl exec calls are timeout-guarded.
       for NS in amd-gpu-operator launchpad-ai; do
         for CAND in $(timeout 10 kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
-          if timeout 10 kubectl -n "$NS" exec "$CAND" -- which rocm-smi >/dev/null 2>&1; then
-            techo "Collecting rocm-smi via $NS/$CAND"
-            timeout 30 kubectl -n "$NS" exec "$CAND" -- rocm-smi -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1 || echo "(rocm-smi -a via kubectl timed out or failed)" >> "$TMPDIR/gpu/amd/rocm-smi-all.txt"
-            timeout 30 kubectl -n "$NS" exec "$CAND" -- rocm-smi --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1 || echo "(rocm-smi --show* via kubectl timed out or failed)" >> "$TMPDIR/gpu/amd/rocm-smi-detail.txt"
+          POD_ROCM_SMI="$(find-rocm-tool-in-pod "$NS" "$CAND" rocm-smi)"
+          POD_AMD_SMI="$(find-rocm-tool-in-pod "$NS" "$CAND" amd-smi)"
+          if [ -n "$POD_ROCM_SMI" ] || [ -n "$POD_AMD_SMI" ]; then
+            if [ -n "$POD_ROCM_SMI" ]; then
+              techo "Collecting rocm-smi via $NS/$CAND ($POD_ROCM_SMI)"
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_ROCM_SMI" -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1 || echo "(rocm-smi -a via kubectl timed out or failed)" >> "$TMPDIR/gpu/amd/rocm-smi-all.txt"
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_ROCM_SMI" --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1 || echo "(rocm-smi --show* via kubectl timed out or failed)" >> "$TMPDIR/gpu/amd/rocm-smi-detail.txt"
+            fi
+            if [ -n "$POD_AMD_SMI" ]; then
+              techo "Collecting amd-smi via $NS/$CAND ($POD_AMD_SMI)"
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" version > "$TMPDIR/gpu/amd/amd-smi-version.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" list > "$TMPDIR/gpu/amd/amd-smi-list.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" static > "$TMPDIR/gpu/amd/amd-smi-static.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" metric > "$TMPDIR/gpu/amd/amd-smi-metric.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" firmware > "$TMPDIR/gpu/amd/amd-smi-firmware.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" bad-pages > "$TMPDIR/gpu/amd/amd-smi-bad-pages.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" topology > "$TMPDIR/gpu/amd/amd-smi-topology.txt" 2>&1 || true
+            fi
             break 2
           fi
         done
       done
+    fi
+
+    if [ -z "$ROCM_SMI_BIN" ] && [ -z "$AMD_SMI_BIN" ] && [ ! -s "$TMPDIR/gpu/amd/rocm-smi-all.txt" ] && [ ! -s "$TMPDIR/gpu/amd/amd-smi-list.txt" ]; then
+      echo "rocm-smi / amd-smi not found on host or in any candidate pod (amd-gpu-operator/launchpad-ai). Searched: PATH, /opt/rocm/bin, /opt/rocm-*/bin, /usr/local/bin, /usr/bin." > "$TMPDIR/gpu/amd/rocm-smi-status"
     fi
 
     # devcoredumps (preserved by /oem udev rule — see launchpad-ai PRs #512, #530)
@@ -1152,17 +1242,6 @@ function mongo-status() {
       echo
     } >> "${TMPDIR}/mongo/disk-usage.txt"
   done < <(printf '%s\n' "$MONGO_PODS")
-
-  techo "Collecting MongoDB database + collection sizes"
-  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval '
-    db.adminCommand({listDatabases:1}).databases.forEach(function(d){
-      var s = db.getSiblingDB(d.name).stats(1024*1024);
-      print(\"DB \"+d.name+\" storageSize(MB)=\"+s.storageSize+\" dataSize(MB)=\"+s.dataSize);
-      db.getSiblingDB(d.name).getCollectionNames().forEach(function(c){
-        var cs = db.getSiblingDB(d.name).getCollection(c).stats(1024*1024);
-        print(\"  \"+d.name+\".\"+c+\" storageSize(MB)=\"+cs.storageSize+\" size(MB)=\"+cs.size+\" count=\"+cs.count);
-      });
-    });'" > "${TMPDIR}/mongo/db-collection-sizes.txt" 2>&1
 }
 
 function k8s-resources() {
@@ -1646,12 +1725,15 @@ networking-info
 var-log
 journald-log
 storage-info
+# gpu-info needs kubectl reachable (to fall back to `kubectl exec` when
+# rocm-smi/amd-smi aren't installed on the host — which is the norm on
+# Kairos), so set-kubeconfig has to run first.
+set-kubeconfig
 gpu-info
 
 stylus-files
 
 crictl-logs
-set-kubeconfig
 spectro-k8s-defaults
 validate-namespace-coverage
 k8s-resources
