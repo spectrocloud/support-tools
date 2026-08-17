@@ -140,11 +140,12 @@ function defaults() {
 function setup() {
   TMPDIR_BASE=$(mktemp -d $MKTEMP_BASEDIR) || { techo 'Creating temporary directory failed, please check options'; exit 1; }
   techo "Created temporary directory: $TMPDIR_BASE"
+  TS="$(date +'%Y-%m-%d_%H_%M_%S')"
   if ! command -v hostname >/dev/null 2>&1; then
     techo "Hostname doesn't exist in the node. Using date timestamp instead !"
-    LOGNAME="$(date +'%Y-%m-%d_%H_%M_%S')"
+    LOGNAME="$TS"
   else
-    LOGNAME="$(hostname)-$(date +'%Y-%m-%d_%H_%M_%S')"
+    LOGNAME="$(hostname)-${TS}"
   fi
   # Sanitize: $TMPDIR is used unquoted in many collectors, so the bundle name
   # must never contain whitespace or shell metacharacters.
@@ -1777,16 +1778,18 @@ function canonical-k8s-snap-info() {
 # ---------------------------------------------------------------------------
 
 function archive() {
-  # Cluster name is unknown at setup() time, so the final bundle name is
-  # decided here: <cluster>-<hostname>-<timestamp>, degrading to
-  # <hostname>-<timestamp> when no cluster was reachable.
+  # Bundle naming matches the legacy scripts: <hostname>-<timestamp> when
+  # host collection is in scope (edge behavior); <cluster-name>-<timestamp>
+  # for cluster-only runs (infra behavior). The cluster name is unknown at
+  # setup() time, so the cluster-only rename happens here, at tar time.
   FINAL_LOGNAME="$LOGNAME"
-  if [ -n "$CLUSTER_NAME" ]; then
-    FINAL_LOGNAME="${CLUSTER_NAME}-${LOGNAME}"
+  if [ "$COLLECT_HOST" = false ] && [ -n "$CLUSTER_NAME" ]; then
+    FINAL_LOGNAME="${CLUSTER_NAME}-${TS}"
     FINAL_LOGNAME="${FINAL_LOGNAME//[^A-Za-z0-9._-]/_}"
   fi
 
   techo "Creating archive ${FINAL_LOGNAME}.tar.gz"
+  techo "Please upload the support bundle to the support ticket"
 
   # Restore original fds to close the tee pipe and flush console.log. Only
   # after this is it safe to rename $TMPDIR.
@@ -1800,11 +1803,18 @@ function archive() {
     fi
   fi
 
-  # Archive to -d <dir> if given, else CWD, else the temp base as last resort.
-  ARCHIVE_DIR="${OUTPUT_DIR:-$PWD}"
-  if [ ! -d "$ARCHIVE_DIR" ] || [ ! -w "$ARCHIVE_DIR" ]; then
-    techo "Archive directory $ARCHIVE_DIR is not writable, falling back to $TMPDIR_BASE"
+  # Destination matches the legacy scripts. Host runs archive into the temp
+  # base dir (edge behavior — edge hosts often have read-only partitions, so
+  # never write to CWD); -d relocates that base. Cluster-only runs archive to
+  # -d <dir> if given, else CWD (infra behavior), else the temp base.
+  if [ "$COLLECT_HOST" = true ]; then
     ARCHIVE_DIR="$TMPDIR_BASE"
+  else
+    ARCHIVE_DIR="${OUTPUT_DIR:-$PWD}"
+    if [ ! -d "$ARCHIVE_DIR" ] || [ ! -w "$ARCHIVE_DIR" ]; then
+      techo "Archive directory $ARCHIVE_DIR is not writable, falling back to $TMPDIR_BASE"
+      ARCHIVE_DIR="$TMPDIR_BASE"
+    fi
   fi
 
   TARBALL="${ARCHIVE_DIR}/${FINAL_LOGNAME}.tar.gz"
@@ -1815,7 +1825,6 @@ function archive() {
   }
 
   techo "Logs are archived in ${TARBALL}"
-  techo "Please upload the support bundle to the support ticket"
 }
 
 function cleanup() {

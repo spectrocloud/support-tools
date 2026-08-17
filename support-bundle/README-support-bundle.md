@@ -78,12 +78,14 @@ Unlike previous script versions, **insufficient RBAC never aborts the run**: den
 
 ## Output
 
-The script creates a compressed tarball named:
+Bundle naming and archive location match the legacy scripts:
 
-* `<cluster-name>-<hostname>-<timestamp>.tar.gz` when a cluster was reachable
-* `<hostname>-<timestamp>.tar.gz` otherwise
+| Run scope | Bundle name | Archive location |
+|-----------|-------------|------------------|
+| Host in scope (default, or `-K`) | `<hostname>-<timestamp>.tar.gz` | Temporary base directory (`mktemp -d`, typically under `/tmp`; `-d <dir>` relocates it) — edge hosts often have read-only partitions, so the archive is never written to the current working directory |
+| Cluster-only (`-H`) | `<cluster-name>-<timestamp>.tar.gz` | `-d <dir>` if given, else the current working directory, else the temporary base directory if neither is writable |
 
-The archive is written to the **current working directory** by default, to `-d <dir>` when given, and to the temporary base directory as a last resort if neither is writable. Every bundle contains `console.log` (the full run transcript), `.support-bundle` (version, scopes, detected capabilities), and `collection-summary.txt`.
+Every bundle contains `console.log` (the full run transcript), `.support-bundle` (version, scopes, detected capabilities), and `collection-summary.txt`.
 
 ## Collected Information
 
@@ -110,6 +112,6 @@ Secrets are not collected, except helm release secrets for the spectro namespace
 Behavioral differences vs. the legacy scripts:
 
 * Insufficient RBAC and a missing/unset `KUBECONFIG` no longer abort the run (previously fatal in both scripts).
-* The archive is written to the current working directory by default (the edge script wrote it to the temporary base directory).
-* The bundle name includes the cluster name when available (previously edge used hostname only, infra used cluster name only).
 * Every run produces `collection-summary.txt` and, when a cluster is reachable, `namespace-coverage.txt`.
+
+Bundle naming and archive locations are unchanged from the legacy scripts (see [Output](#output)).
