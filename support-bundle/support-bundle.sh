@@ -1,0 +1,2052 @@
+#!/bin/bash
+# Copyright 2026 Spectro Cloud
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Consolidated SpectroCloud support bundle collector.
+# Supersedes support-bundle-edge.sh (host + cluster) and
+# support-bundle-infra.sh (cluster only), which are kept alongside as
+# fallbacks until this script is widely adopted.
+#
+# Collection is capability-driven: every collector is gated on the
+# capabilities it needs (root, journald, crictl, a reachable API server, …)
+# and records OK / SKIP / FAIL / DENIED into collection-summary.txt.
+# A partial bundle always beats no bundle: the only fatal errors are
+# failure to create the temp directory or write the archive.
+
+SB_VERSION=20260817+dev
+
+DEFAULT_KUBECONFIG="/run/kubeconfig"
+
+JOURNALD_LOGS=(
+  # edge-cluster
+  stylus-agent stylus-operator palette-tui
+  # agent-mode
+  spectro-stylus-agent spectro-stylus-operator spectro-init spectro-palette-agent-start spectro-palette-agent-initramfs spectro-palette-agent-boot spectro-palette-agent-network spectro-palette-agent-bootstrap
+  # system
+  systemd-timesyncd chronyd
+  # k8s
+  containerd spectro-containerd kubelet k3s k3s-agent rke2-server rke2-agent
+  # Canonical Kubernetes (snap-based) common units
+  k8s.kubelet k8s.kube-apiserver k8s.kube-controller-manager k8s.kube-scheduler k8s.kube-proxy
+  snap.k8s.kubelet snap.k8s.kube-apiserver snap.k8s.kube-controller-manager snap.k8s.kube-scheduler snap.k8s.kube-proxy
+  # Kairos specific services
+  cos-setup-boot
+  )
+
+SYSTEM_NAMESPACES=(amd-gpu-operator capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default gpu-operator grafana harbor headlamp keycloak konveyor-forklift kube-system kube-public kubernetes-dashboard kubevirt launchpad-ai longhorn-system metallb-system os-patch palette-system piraeus-system reach-system rook-ceph spectro-system spectro-task system-upgrade traefik victoria-metrics vm-dashboard zot-system)
+
+API_RESOURCES=(apiservices clusterroles clusterrolebindings crds csr mutatingwebhookconfigurations namespaces nodes priorityclasses pv storageclasses validatingwebhookconfigurations volumeattachments)
+
+API_RESOURCES_NAMESPACED=(apiservices configmaps cronjobs daemonsets deployments endpoints endpointslices events hpa ingress jobs leases limitranges networkpolicies poddisruptionbudgets pods pvc replicasets resourcequotas roles rolebindings services serviceaccounts statefulsets)
+
+VAR_LOG_LINES=500000
+
+# Collection scopes; -H disables host, -K disables kubernetes
+COLLECT_HOST=true
+COLLECT_K8S=true
+QUIET=false
+
+# ---------------------------------------------------------------------------
+# lib — logging, status registry, step runner
+# ---------------------------------------------------------------------------
+
+function timestamp() {
+  date "+%Y-%m-%d %H:%M:%S"
+}
+
+function techo() {
+  echo "$(timestamp): $*"
+}
+
+STATUS_REGISTRY=()
+
+# record-status <STATUS> <step> [note]
+function record-status() {
+  STATUS_REGISTRY+=("$1|$2|${3:-}")
+}
+
+# Collectors call `skip <reason>` (or set STEP_STATUS/STEP_NOTE directly)
+# before returning 0 to report a non-OK outcome to run_step.
+function skip() {
+  STEP_STATUS=SKIP
+  STEP_NOTE="$*"
+  return 0
+}
+
+# run_step <label> <function> — runs a collector, records its outcome, and
+# never propagates failure so a broken collector cannot abort the run.
+function run_step() {
+  local LABEL="$1" FN="$2"
+  STEP_STATUS=""
+  STEP_NOTE=""
+  if "$FN"; then
+    record-status "${STEP_STATUS:-OK}" "$LABEL" "$STEP_NOTE"
+  else
+    record-status "${STEP_STATUS:-FAIL}" "$LABEL" "${STEP_NOTE:-collector exited non-zero}"
+  fi
+  return 0
+}
+
+function print-summary() {
+  local ENTRY ST STEP NOTE
+  {
+    echo "Support Bundle Collection Summary"
+    echo "Version:   $SB_VERSION"
+    echo "Generated: $(timestamp)"
+    echo ""
+    printf "%-8s %-30s %s\n" "STATUS" "STEP" "NOTE"
+    printf "%-8s %-30s %s\n" "------" "----" "----"
+    for ENTRY in "${STATUS_REGISTRY[@]}"; do
+      IFS='|' read -r ST STEP NOTE <<< "$ENTRY"
+      printf "%-8s %-30s %s\n" "$ST" "$STEP" "$NOTE"
+    done
+  } | tee "$TMPDIR/collection-summary.txt"
+}
+
+# ---------------------------------------------------------------------------
+# probe — environment discovery; sets capabilities, DISTRO, kubeconfig
+# ---------------------------------------------------------------------------
+
+function load-env() {
+  if [ -f /etc/spectro/environment ]; then
+    . /etc/spectro/environment
+  fi
+  export PATH=$PATH:$STYLUS_ROOT/usr/bin:$STYLUS_ROOT/usr/sbin:$STYLUS_ROOT/usr/local/bin
+}
+
+function defaults() {
+  CRICTL_FLAGS+=" --tail=${VAR_LOG_LINES}"
+  techo "Using Crictl flags: ${CRICTL_FLAGS}"
+
+  if [ -z "$JOURNALD_FLAGS" ]; then
+    JOURNALD_FLAGS+=" -n ${VAR_LOG_LINES}"
+    techo "No number of log lines defined for collection. Collecting last 500k log lines from journald and crictl logs"
+  else
+    techo "Using Journald flags: ${JOURNALD_FLAGS}"
+  fi
+}
+
+function setup() {
+  TMPDIR_BASE=$(mktemp -d $MKTEMP_BASEDIR) || { techo 'Creating temporary directory failed, please check options'; exit 1; }
+  techo "Created temporary directory: $TMPDIR_BASE"
+  if ! command -v hostname >/dev/null 2>&1; then
+    techo "Hostname doesn't exist in the node. Using date timestamp instead !"
+    LOGNAME="$(date +'%Y-%m-%d_%H_%M_%S')"
+  else
+    LOGNAME="$(hostname)-$(date +'%Y-%m-%d_%H_%M_%S')"
+  fi
+  # Sanitize: $TMPDIR is used unquoted in many collectors, so the bundle name
+  # must never contain whitespace or shell metacharacters.
+  LOGNAME="${LOGNAME//[^A-Za-z0-9._-]/_}"
+
+  TMPDIR="${TMPDIR_BASE}/${LOGNAME}"
+  mkdir -p "$TMPDIR" || { echo "Failed to create temporary log directory $TMPDIR"; exit 1; }
+
+  # Save original file descriptors before redirecting. archive() restores
+  # them (exec 1>&3 2>&4) before tar so the tee pipe flushes and console.log
+  # isn't truncated. Do not rename $TMPDIR while the tee holds it open.
+  exec 3>&1 4>&2
+  exec > >(tee -a "$TMPDIR/console.log") 2>&1
+  techo "Collecting logs in $TMPDIR"
+  {
+    echo "Support Bundle Version: $SB_VERSION"
+    echo "Host collection: $COLLECT_HOST"
+    echo "Kubernetes collection: $COLLECT_K8S"
+  } > "$TMPDIR/.support-bundle"
+}
+
+# Agent-mode kubeadm uses stylus crictl and spectro-containerd, not host defaults.
+function agent-mode-kubeadm-setup() {
+  if [ ! -f "${STYLUS_ROOT}/opt/spectrocloud/state/agent-mode" ]; then
+    return
+  fi
+
+  techo "Detected agent-mode kubeadm host"
+
+  if [ -x "${STYLUS_ROOT}/usr/bin/crictl" ]; then
+    CRICTL_BIN="${STYLUS_ROOT}/usr/bin/crictl"
+    techo "Using agent-mode crictl binary at ${CRICTL_BIN}"
+  fi
+
+  if [ -S "/run/spectro/containerd/containerd.sock" ]; then
+    export CONTAINER_RUNTIME_ENDPOINT="unix:///run/spectro/containerd/containerd.sock"
+    techo "Using agent-mode containerd socket at ${CONTAINER_RUNTIME_ENDPOINT}"
+  fi
+}
+
+function canonical-k8s-setup() {
+  CK8S_CURRENT_DIR="/var/snap/k8s/current"
+  CK8S_COMMON_DIR="/var/snap/k8s/common"
+
+  # Configure CRI for Canonical k8s snap if available
+  if [ -z "${CRI_CONFIG_FILE}" ] && [ -f "${CK8S_CURRENT_DIR}/args/crictl.yaml" ]; then
+    export CRI_CONFIG_FILE="${CK8S_CURRENT_DIR}/args/crictl.yaml"
+    techo "Using Canonical k8s crictl config at ${CRI_CONFIG_FILE}"
+  elif [ -z "${CONTAINER_RUNTIME_ENDPOINT}" ] && [ -S "${CK8S_COMMON_DIR}/run/containerd.sock" ]; then
+    export CONTAINER_RUNTIME_ENDPOINT="unix://${CK8S_COMMON_DIR}/run/containerd.sock"
+    techo "Using Canonical k8s containerd socket at ${CONTAINER_RUNTIME_ENDPOINT}"
+  elif [ -z "${CONTAINER_RUNTIME_ENDPOINT}" ] && [ -S "/run/containerd/containerd.sock" ]; then
+    export CONTAINER_RUNTIME_ENDPOINT="unix:///run/containerd/containerd.sock"
+    techo "Using default containerd socket at ${CONTAINER_RUNTIME_ENDPOINT}"
+  fi
+}
+
+function rke2-setup() {
+  if RKE2_BIN=$(command -v rke2 2>/dev/null); then
+    techo "Using RKE2 binary... ${RKE2_BIN}"
+  else
+    techo "rke2 command can run, but the binary can't be found"
+  fi
+
+  RKE2_DATA_DIR="/var/lib/rancher/rke2" # TODO: input custom-data-dir
+  if [ -d "${RKE2_DATA_DIR}" ]; then
+    if [ -f "${RKE2_DATA_DIR}/bin/crictl" ]; then
+      CRICTL_BIN="${RKE2_DATA_DIR}/bin/crictl"
+
+      if [ -f "${RKE2_DATA_DIR}/agent/etc/crictl.yaml" ]; then
+        export CRI_CONFIG_FILE="${RKE2_DATA_DIR}/agent/etc/crictl.yaml"
+      fi
+    fi
+
+    if [ -f "${RKE2_DATA_DIR}/bin/kubectl" ]; then
+      KUBECTL_BIN="${RKE2_DATA_DIR}/bin/kubectl"
+    fi
+  else
+    techo "RKE2 data directory ${RKE2_DATA_DIR} does not exist"
+  fi
+}
+
+function sherlock() {
+  techo "Detecting k8s distribution"
+  if (command -v kubeadm > /dev/null 2>&1); then
+    DISTRO="kubeadm"
+    agent-mode-kubeadm-setup
+    if [ -z "${CRI_CONFIG_FILE}" ] && [ -z "${CONTAINER_RUNTIME_ENDPOINT}" ] \
+      && [ ! -f /etc/crictl.yaml ] && [ -S /run/containerd/containerd.sock ]; then
+      cat > "${TMPDIR}/crictl.yaml" <<EOF
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+EOF
+      export CRI_CONFIG_FILE="${TMPDIR}/crictl.yaml"
+    fi
+  elif (command -v k3s > /dev/null 2>&1); then
+    if k3s crictl ps >/dev/null 2>&1; then
+        DISTRO="k3s"
+    else
+      FOUND+="k3s"
+    fi
+  elif (command -v rke2 > /dev/null 2>&1); then
+    rke2-setup
+    if ${RKE2_BIN} >/dev/null 2>&1; then
+      DISTRO="rke2"
+    else
+      FOUND+="rke2"
+    fi
+  elif [ -d "/var/snap/k8s" ] || \
+       systemctl list-units --full -all 2>/dev/null | grep -Fq "k8s.kubelet.service" || \
+       systemctl list-units --full -all 2>/dev/null | grep -Fq "snap.k8s.kubelet.service" || \
+       (command -v snap >/dev/null 2>&1 && snap list 2>/dev/null | grep -q "^k8s "); then
+    canonical-k8s-setup
+    DISTRO="canonical"
+  fi
+
+  if [ -z "${DISTRO}" ]; then
+    if [ -n "${FOUND}" ]; then
+      techo "Could not detect K8s distribution. Found ${FOUND}"
+      skip "no runnable k8s distribution (found: ${FOUND})"
+    else
+      techo "Could not detect K8s distribution."
+      skip "no k8s distribution detected"
+    fi
+  else
+    techo "K8s distribution detected: ${DISTRO}"
+    STEP_NOTE="detected ${DISTRO}"
+  fi
+}
+
+# Ordered kubeconfig resolution; first readable wins, never fatal.
+function resolve-kubeconfig() {
+  local CANDIDATES=() CANDIDATE SUDO_HOME
+
+  [ -n "$KUBECONFIG_FLAG" ] && CANDIDATES+=("$KUBECONFIG_FLAG")
+  [ -n "$KUBECONFIG" ] && CANDIDATES+=("$KUBECONFIG")
+  CANDIDATES+=("$DEFAULT_KUBECONFIG" "/etc/kubernetes/admin.conf" "$HOME/.kube/config")
+  # Under sudo, $HOME is root's — the invoking operator's kubeconfig would
+  # otherwise be invisible.
+  if [ -n "$SUDO_USER" ] && command -v getent >/dev/null 2>&1; then
+    SUDO_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    [ -n "$SUDO_HOME" ] && CANDIDATES+=("$SUDO_HOME/.kube/config")
+  fi
+  CANDIDATES+=("/etc/rancher/rke2/rke2.yaml" "/etc/rancher/k3s/k3s.yaml" "/var/snap/k8s/current/credentials/admin.conf")
+
+  for CANDIDATE in "${CANDIDATES[@]}"; do
+    if [ -r "$CANDIDATE" ]; then
+      export KUBECONFIG="$CANDIDATE"
+      techo "Using kubeconfig: $KUBECONFIG"
+      STEP_NOTE="$KUBECONFIG"
+      return 0
+    fi
+  done
+
+  techo "No readable kubeconfig found. Kubernetes collection will be skipped unless kubectl works without one."
+  skip "no readable kubeconfig found"
+}
+
+function detect-capabilities() {
+  HAS_ROOT=false;     [ "$EUID" -eq 0 ] && HAS_ROOT=true
+  HAS_SYSTEMD=false;  command -v systemctl >/dev/null 2>&1 && HAS_SYSTEMD=true
+  HAS_JOURNALD=false; command -v journalctl >/dev/null 2>&1 && HAS_JOURNALD=true
+  HAS_CRICTL=false;   crictl ps >/dev/null 2>&1 && HAS_CRICTL=true
+
+  # `kubectl version` alone passes with a client-only binary; probe the API
+  # server with an explicit timeout so a dead control plane doesn't stall.
+  HAS_CLUSTER=false
+  if kubectl version --request-timeout=10s >/dev/null 2>&1; then
+    HAS_CLUSTER=true
+  fi
+
+  IS_EDGE_HOST=false
+  if [ -d /oem ] || [ -d /run/stylus ] || [ -f /etc/spectro/environment ]; then
+    IS_EDGE_HOST=true
+  fi
+
+  IS_AGENT_MODE=false
+  [ -f "${STYLUS_ROOT}/opt/spectrocloud/state/agent-mode" ] && IS_AGENT_MODE=true
+
+  HELM_BIN=""
+  if [ -x "$STYLUS_ROOT/opt/spectrocloud/bin/helm" ]; then
+    HELM_BIN="$STYLUS_ROOT/opt/spectrocloud/bin/helm"
+  elif command -v helm >/dev/null 2>&1; then
+    HELM_BIN=$(command -v helm)
+  fi
+
+  {
+    echo "HAS_ROOT=$HAS_ROOT"
+    echo "HAS_SYSTEMD=$HAS_SYSTEMD"
+    echo "HAS_JOURNALD=$HAS_JOURNALD"
+    echo "HAS_CRICTL=$HAS_CRICTL"
+    echo "HAS_CLUSTER=$HAS_CLUSTER"
+    echo "IS_EDGE_HOST=$IS_EDGE_HOST"
+    echo "IS_AGENT_MODE=$IS_AGENT_MODE"
+    echo "DISTRO=${DISTRO:-}"
+    echo "HELM_BIN=${HELM_BIN:-}"
+    echo "KUBECONFIG=${KUBECONFIG:-}"
+  } >> "$TMPDIR/.support-bundle"
+  techo "Capabilities: root=$HAS_ROOT journald=$HAS_JOURNALD crictl=$HAS_CRICTL cluster=$HAS_CLUSTER edge-host=$IS_EDGE_HOST distro=${DISTRO:-none}"
+}
+
+# crictl/kubectl shims: prefer distro-bundled binaries over PATH.
+function crictl() {
+  if [[ -n "$CRICTL_BIN" && -x "$CRICTL_BIN" ]]; then
+    "$CRICTL_BIN" "$@"
+  elif command -v crictl >/dev/null 2>&1; then
+    command crictl "$@"
+  else
+    return 1
+  fi
+}
+
+function kubectl() {
+  if [[ -n "$KUBECTL_BIN" && -x "$KUBECTL_BIN" ]]; then
+    "$KUBECTL_BIN" "$@"
+  elif command -v kubectl >/dev/null 2>&1; then
+    command kubectl "$@"
+  else
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# host — OS-level collectors
+# ---------------------------------------------------------------------------
+
+function system-info() {
+  techo "Collecting system info"
+  mkdir -p $TMPDIR/systeminfo
+
+  if command -v hostname >/dev/null 2>&1; then
+    hostname > $TMPDIR/systeminfo/hostname 2>&1
+    hostname -f > $TMPDIR/systeminfo/hostnamefqdn 2>&1
+  fi
+
+  cat /proc/cmdline > $TMPDIR/systeminfo/cmdline 2>&1
+  cat /etc/*release > $TMPDIR/systeminfo/osrelease 2>&1
+
+  cp -p /etc/hosts $TMPDIR/systeminfo/etchosts 2>&1
+  cp -p /etc/resolv.conf $TMPDIR/systeminfo/etcresolvconf 2>&1
+}
+
+function chronyd-info() {
+  if ! command -v chronyc >/dev/null 2>&1; then
+    skip "chronyc not present"
+    return 0
+  fi
+
+  techo "Collecting chronyd time synchronization info"
+  mkdir -p $TMPDIR/chronyd
+
+  # Collect current system time and date information
+  date > $TMPDIR/chronyd/system-date 2>&1
+  timedatectl status > $TMPDIR/chronyd/timedatectl-status 2>&1 || techo "timedatectl not available"
+
+  # Collect chronyd tracking status (shows current time sync state)
+  chronyc tracking > $TMPDIR/chronyd/tracking 2>&1
+
+  # Collect NTP sources (shows all NTP servers being used)
+  chronyc sources -v > $TMPDIR/chronyd/sources-verbose 2>&1
+
+  # Collect source statistics
+  chronyc sourcestats -v > $TMPDIR/chronyd/sourcestats-verbose 2>&1
+
+  # Collect chronyd activity status
+  chronyc activity > $TMPDIR/chronyd/activity 2>&1
+
+  # Collect NTP server statistics (if server mode is enabled)
+  chronyc serverstats > $TMPDIR/chronyd/serverstats 2>&1
+
+  # Collect chronyd version
+  chronyc -v > $TMPDIR/chronyd/version 2>&1
+
+  # Collect chronyd service status
+  systemctl status chronyd > $TMPDIR/chronyd/service-status 2>&1 || techo "chronyd service not found in systemctl"
+
+  # Check if chronyd is enabled
+  systemctl is-enabled chronyd > $TMPDIR/chronyd/service-enabled 2>&1 || techo "chronyd service not enabled"
+
+  # Collect chronyd configuration files
+  if [ -f /etc/chrony.conf ]; then
+    cp -p /etc/chrony.conf $TMPDIR/chronyd/chrony.conf 2>&1
+    techo "Collected /etc/chrony.conf"
+  fi
+
+  if [ -f /etc/chrony/chrony.conf ]; then
+    cp -p /etc/chrony/chrony.conf $TMPDIR/chronyd/chrony.conf 2>&1
+    techo "Collected /etc/chrony/chrony.conf"
+  fi
+
+  # Collect chrony.d configuration directory if it exists
+  if [ -d /etc/chrony.d ]; then
+    mkdir -p $TMPDIR/chronyd/chrony.d
+    ls -lah /etc/chrony.d/ > $TMPDIR/chronyd/chrony.d/files 2>&1
+    cp -p /etc/chrony.d/* $TMPDIR/chronyd/chrony.d/ 2>&1
+    techo "Collected /etc/chrony.d/ configuration files"
+  fi
+
+  # Collect chrony drift file if it exists
+  if [ -f /var/lib/chrony/drift ]; then
+    cp -p /var/lib/chrony/drift $TMPDIR/chronyd/drift 2>&1
+    techo "Collected chronyd drift file"
+  fi
+
+  techo "Chronyd information collection complete"
+}
+
+function networking-info() {
+  techo "Collecting network info"
+  mkdir -p $TMPDIR/networking
+  iptables-save > $TMPDIR/networking/iptablessave 2>&1
+  ip6tables-save > $TMPDIR/networking/ip6tablessave 2>&1
+  if [ ! "${OSRELEASE}" = "sles" ]
+    then
+      IPTABLES_FLAGS="--wait 1"
+  fi
+  iptables $IPTABLES_FLAGS --numeric --verbose --list --table mangle > $TMPDIR/networking/iptablesmangle 2>&1
+  iptables $IPTABLES_FLAGS --numeric --verbose --list --table nat > $TMPDIR/networking/iptablesnat 2>&1
+  iptables $IPTABLES_FLAGS --numeric --verbose --list > $TMPDIR/networking/iptables 2>&1
+  ip6tables $IPTABLES_FLAGS --numeric --verbose --list --table mangle > $TMPDIR/networking/ip6tablesmangle 2>&1
+  ip6tables $IPTABLES_FLAGS --numeric --verbose --list --table nat > $TMPDIR/networking/ip6tablesnat 2>&1
+  ip6tables $IPTABLES_FLAGS --numeric --verbose --list > $TMPDIR/networking/ip6tables 2>&1
+  if command -v nft >/dev/null 2>&1; then
+    nft list ruleset  > $TMPDIR/networking/nft_ruleset 2>&1
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat --programs --all --numeric --tcp --udp > $TMPDIR/networking/netstat 2>&1
+    netstat --statistics > $TMPDIR/networking/netstatistics 2>&1
+  fi
+  if command -v ipvsadm >/dev/null 2>&1; then
+    ipvsadm -ln > $TMPDIR/networking/ipvsadm 2>&1
+  fi
+  if [ -f /proc/net/xfrm_stat ]
+    then
+      cat /proc/net/xfrm_stat > $TMPDIR/networking/procnetxfrmstat 2>&1
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    ip addr show > $TMPDIR/networking/ipaddrshow 2>&1
+    ip route show table all > $TMPDIR/networking/iproute 2>&1
+    ip neighbour > $TMPDIR/networking/ipneighbour 2>&1
+    ip rule show > $TMPDIR/networking/iprule 2>&1
+    ip -s link show > $TMPDIR/networking/iplinkshow 2>&1
+    ip -6 neighbour > $TMPDIR/networking/ipv6neighbour 2>&1
+    ip -6 rule show > $TMPDIR/networking/ipv6rule 2>&1
+    ip -6 route show > $TMPDIR/networking/ipv6route 2>&1
+    ip -6 addr show > $TMPDIR/networking/ipv6addrshow 2>&1
+  fi
+  if command -v ifconfig >/dev/null 2>&1; then
+    ifconfig -a > $TMPDIR/networking/ifconfiga
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    ss -anp > $TMPDIR/networking/ssanp 2>&1
+    ss -itan > $TMPDIR/networking/ssitan 2>&1
+    ss -uapn > $TMPDIR/networking/ssuapn 2>&1
+    ss -wapn > $TMPDIR/networking/sswapn 2>&1
+    ss -xapn > $TMPDIR/networking/ssxapn 2>&1
+    ss -4apn > $TMPDIR/networking/ss4apn 2>&1
+    ss -6apn > $TMPDIR/networking/ss6apn 2>&1
+    ss -tunlp6 > $TMPDIR/networking/sstunlp6 2>&1
+    ss -tunlp4 > $TMPDIR/networking/sstunlp4 2>&1
+  fi
+  if [ -d /etc/cni/net.d/ ]; then
+    mkdir -p $TMPDIR/networking/cni
+    cp -r -p /etc/cni/net.d/* $TMPDIR/networking/cni 2>&1
+  fi
+}
+
+function var-log() {
+  techo "Collecting logs from /var/log"
+  mkdir -p $TMPDIR/var/log
+  for logfile in /var/log/*log*; do
+    if file "$logfile" | grep -q "text"; then
+      cp -p "$logfile" "$TMPDIR/var/log" 2>&1
+    fi
+  done
+
+  # Collect SpectroCloud logs written by system tasks (e.g. cert renewal)
+  if [ -d /var/log/spectrocloud ]; then
+    techo "Collecting logs from /var/log/spectrocloud"
+    mkdir -p "$TMPDIR/var/log/spectrocloud"
+    ls -lah /var/log/spectrocloud/ > "$TMPDIR/var/log/spectrocloud/files" 2>&1
+    for logfile in /var/log/spectrocloud/*; do
+      if [ -f "$logfile" ] && file "$logfile" | grep -q "text"; then
+        cp -p "$logfile" "$TMPDIR/var/log/spectrocloud" 2>&1
+      fi
+    done
+  fi
+}
+
+function journald-log() {
+  if ! command -v journalctl >/dev/null 2>&1; then
+    skip "journalctl not present"
+    return 0
+  fi
+
+  techo "Collecting logs from journald using flags ${JOURNALD_FLAGS}"
+  mkdir -p $TMPDIR/journald
+
+  journalctl --no-pager -k $JOURNALD_FLAGS >"$TMPDIR/journald/dmesg"
+  journalctl --no-pager --list-boot $JOURNALD_FLAGS >"$TMPDIR/journald/journal-boot"
+
+  # Previous boot's kernel log — critical for post-crash forensics (GPU wedges,
+  # PCIe faults, kernel panics that force a reboot). Only present when
+  # journald has persistent storage enabled (Storage=persistent, /var/log/journal
+  # populated). Empty file on volatile systems is normal.
+  if [ -d /var/log/journal ] && journalctl --list-boots --no-pager 2>/dev/null | awk '{print $1}' | grep -q '^-1$'; then
+    techo "Collecting kernel log from previous boot (post-crash forensics)"
+    journalctl --no-pager -b -1 -k >"$TMPDIR/journald/dmesg-previous-boot" 2>&1
+    journalctl --no-pager -b -1 >"$TMPDIR/journald/journalctl-previous-boot" 2>&1
+  fi
+
+  for JOURNALD_LOG in "${JOURNALD_LOGS[@]}"; do
+    if systemctl list-units --full -all | grep -Fq "$JOURNALD_LOG.service"; then
+      techo "Collecting logs for $JOURNALD_LOG"
+      journalctl --no-pager -u "$JOURNALD_LOG" $JOURNALD_FLAGS >"$TMPDIR/journald/$JOURNALD_LOG.log"
+    fi
+  done
+
+  journalctl --no-pager $JOURNALD_FLAGS >"$TMPDIR/journald/journalctl"
+}
+
+function storage-info() {
+  # Collect host storage state — block devices, filesystems, LVM, NVMe.
+  # Palette edge hosts run on LVM (spectro-data-vg / spectro-data-lv) with
+  # the persistent partition at /opt; AI appliances additionally park model
+  # weights under /opt/data/spectrocloud/models/ (hundreds of GB), so LVM
+  # health and NVMe state are load-bearing for troubleshooting.
+  techo "Collecting storage info"
+  mkdir -p "$TMPDIR/storage"
+
+  # Block devices + filesystems
+  if command -v lsblk >/dev/null 2>&1; then
+    lsblk -f > "$TMPDIR/storage/lsblk-f.txt" 2>&1
+    lsblk -o NAME,SIZE,TYPE,MOUNTPOINTS,FSTYPE,LABEL,UUID,MODEL,SERIAL,TRAN,ROTA,STATE > "$TMPDIR/storage/lsblk-detail.txt" 2>&1
+  fi
+
+  # Filesystem usage
+  df -h > "$TMPDIR/storage/df-h.txt" 2>&1
+  df -i > "$TMPDIR/storage/df-i.txt" 2>&1
+
+  # Mount state
+  cat /proc/mounts > "$TMPDIR/storage/proc-mounts" 2>&1
+  [ -f /etc/fstab ] && cp -p /etc/fstab "$TMPDIR/storage/etc-fstab" 2>&1
+
+  # Partition tables
+  if command -v fdisk >/dev/null 2>&1; then
+    fdisk -l > "$TMPDIR/storage/fdisk-l.txt" 2>&1
+  fi
+
+  # LVM (Palette persistent partition is LVM-backed by default)
+  if command -v pvdisplay >/dev/null 2>&1; then
+    pvdisplay > "$TMPDIR/storage/pvdisplay.txt" 2>&1
+    vgdisplay > "$TMPDIR/storage/vgdisplay.txt" 2>&1
+    lvdisplay > "$TMPDIR/storage/lvdisplay.txt" 2>&1
+    pvs > "$TMPDIR/storage/pvs.txt" 2>&1
+    vgs > "$TMPDIR/storage/vgs.txt" 2>&1
+    lvs > "$TMPDIR/storage/lvs.txt" 2>&1
+  fi
+
+  # NVMe inventory + SMART health (per-drive). timeout guards against a
+  # wedged controller returning slowly or hanging.
+  if command -v nvme >/dev/null 2>&1; then
+    timeout 15 nvme list > "$TMPDIR/storage/nvme-list.txt" 2>&1 || echo "(nvme list timed out or failed)" >> "$TMPDIR/storage/nvme-list.txt"
+    for dev in /dev/nvme[0-9]*n[0-9]*; do
+      [ -b "$dev" ] || continue
+      name=$(basename "$dev")
+      timeout 10 nvme id-ctrl "$dev" > "$TMPDIR/storage/nvme-idctrl-${name}.txt" 2>&1 || true
+      timeout 10 nvme smart-log "$dev" > "$TMPDIR/storage/nvme-smart-${name}.txt" 2>&1 || true
+    done
+  fi
+  if command -v smartctl >/dev/null 2>&1; then
+    for dev in /dev/nvme[0-9]*n[0-9]* /dev/sd? /dev/nvme[0-9]*; do
+      [ -b "$dev" ] || continue
+      name=$(basename "$dev")
+      # smartctl on a failing drive can wait tens of seconds per query.
+      timeout 20 smartctl -a "$dev" > "$TMPDIR/storage/smartctl-${name}.txt" 2>&1 || true
+    done
+  fi
+
+  # sysfs block device attributes — mirrors what stylus/pkg/disk reads for
+  # disk enumeration (dm UUIDs for LVM/dm-crypt/multipath, rotational flag
+  # for SSD vs HDD, hidden flag, raw size). All read-only sysfs paths.
+  if [ -d /sys/block ]; then
+    {
+      for d in /sys/block/*; do
+        [ -d "$d" ] || continue
+        name=$(basename "$d")
+        printf "=== %s ===\n" "$name"
+        for attr in size hidden removable ro queue/rotational queue/scheduler dm/name dm/uuid device/model device/vendor device/serial; do
+          [ -r "$d/$attr" ] && printf "  %-24s = %s\n" "$attr" "$(cat "$d/$attr" 2>/dev/null)"
+        done
+      done
+    } > "$TMPDIR/storage/sysfs-block-attributes.txt" 2>&1
+  fi
+
+  # /dev/disk/by-* symlink inventory — canonical for UUID / PARTUUID / LABEL /
+  # PATH / ID lookups. Read-only listing.
+  if [ -d /dev/disk ]; then
+    ls -laR /dev/disk > "$TMPDIR/storage/dev-disk-tree.txt" 2>&1
+  fi
+
+  # Device-mapper tree — LVM, multipath, dm-crypt topology. Read-only.
+  if command -v dmsetup >/dev/null 2>&1; then
+    dmsetup ls --tree > "$TMPDIR/storage/dmsetup-tree.txt" 2>&1
+    dmsetup info > "$TMPDIR/storage/dmsetup-info.txt" 2>&1
+  fi
+
+  # NVMe native-multipath subsystem enumeration (stylus/pkg/disk treats
+  # /sys/devices/virtual/nvme-subsystem/* as real disks — worth capturing).
+  if [ -d /sys/class/nvme-subsystem ]; then
+    ls -laR /sys/class/nvme-subsystem > "$TMPDIR/storage/nvme-subsystem-tree.txt" 2>&1
+  fi
+}
+
+function gpu-info() {
+  # Collect GPU host state for AI/inference appliances (launchpad-ai and other
+  # GPU-bearing edge nodes). Emits an empty gpu/ directory on nodes with no
+  # GPU — safe on non-GPU hosts.
+  techo "Collecting GPU info (AMD + NVIDIA)"
+  mkdir -p "$TMPDIR/gpu"
+
+  # PCI enumeration — always available, tells us what GPUs are present even
+  # when vendor tooling isn't installed on the host.
+  if command -v lspci >/dev/null 2>&1; then
+    lspci -nn 2>/dev/null | grep -iE "vga|3d|display|nvidia|amd/ati|amd inst|advanced micro" > "$TMPDIR/gpu/lspci-gpu.txt" 2>&1
+    lspci -tv > "$TMPDIR/gpu/lspci-tree.txt" 2>&1
+  fi
+
+  # --- AMD (amdgpu, ROCm) ---
+  # Kairos/Palette edge hosts are minimal and typically do NOT have rocm-smi
+  # on the host — the tool ships inside GPU-workload containers. We prefer
+  # sysfs (always available) and fall back to running rocm-smi via kubectl
+  # exec if the amdgpu operator's device-plugin pod exists.
+  if [ -d /sys/module/amdgpu ]; then
+    techo "Collecting AMD GPU info"
+    mkdir -p "$TMPDIR/gpu/amd"
+
+    # Driver version
+    cat /sys/module/amdgpu/version > "$TMPDIR/gpu/amd/amdgpu-module-version" 2>&1
+    modinfo amdgpu > "$TMPDIR/gpu/amd/amdgpu-modinfo" 2>&1
+
+    # Module parameters (lockup_timeout, reset_method, gpu_recovery, etc.)
+    for p in /sys/module/amdgpu/parameters/*; do
+      [ -r "$p" ] && printf "%s = %s\n" "$(basename "$p")" "$(cat "$p" 2>/dev/null)"
+    done > "$TMPDIR/gpu/amd/amdgpu-parameters" 2>&1
+
+    # Kernel messages matching amdgpu / drm / pcieport — the primary signal
+    # for GPU driver panics, DRM subsystem faults, and PCIe link-training or
+    # AER errors that userspace tools (rocm-smi/amd-smi) won't surface.
+    if command -v dmesg >/dev/null 2>&1; then
+      dmesg -T 2>/dev/null | grep -iE "amdgpu|drm|pcieport" > "$TMPDIR/gpu/amd/amdgpu-dmesg.log" 2>&1 || \
+        dmesg | grep -iE "amdgpu|drm|pcieport" > "$TMPDIR/gpu/amd/amdgpu-dmesg.log" 2>&1 || true
+    fi
+
+    # Per-card VBIOS + firmware component versions from sysfs
+    for pcidir in /sys/bus/pci/devices/*/vbios_version; do
+      [ -f "$pcidir" ] || continue
+      pci=$(basename "$(dirname "$pcidir")")
+      printf "%s  VBIOS=%s\n" "$pci" "$(cat "$pcidir")" >> "$TMPDIR/gpu/amd/amdgpu-vbios-versions"
+    done 2>/dev/null
+    for fwdir in /sys/bus/pci/devices/*/fw_version; do
+      [ -d "$fwdir" ] || continue
+      pci=$(basename "$(dirname "$fwdir")")
+      {
+        echo "=== $pci ==="
+        for f in "$fwdir"/*; do
+          [ -r "$f" ] && printf "  %-20s = %s\n" "$(basename "$f")" "$(cat "$f" 2>/dev/null)"
+        done
+      } >> "$TMPDIR/gpu/amd/amdgpu-firmware-versions"
+    done 2>/dev/null
+
+    # RAS state per card (bad-page counts, ECC counters)
+    for rasdir in /sys/bus/pci/devices/*/ras; do
+      [ -d "$rasdir" ] || continue
+      pci=$(basename "$(dirname "$rasdir")")
+      {
+        echo "=== $pci ==="
+        for f in "$rasdir"/*_err_count "$rasdir"/features "$rasdir"/gpu_vram_bad_pages_count; do
+          [ -r "$f" ] && printf "  %-30s = %s\n" "$(basename "$f")" "$(cat "$f" 2>/dev/null)"
+        done
+      } >> "$TMPDIR/gpu/amd/amdgpu-ras-state"
+    done 2>/dev/null
+
+    # Per-card temperature/utilization from hwmon
+    for hwmondir in /sys/bus/pci/devices/*/hwmon/hwmon*; do
+      [ -d "$hwmondir" ] || continue
+      pci=$(basename "$(dirname "$(dirname "$hwmondir")")")
+      {
+        echo "=== $pci ==="
+        for f in "$hwmondir"/temp*_input "$hwmondir"/temp*_label \
+                 "$hwmondir"/power*_average "$hwmondir"/power*_cap \
+                 "$hwmondir"/in*_input "$hwmondir"/fan*_input; do
+          [ -r "$f" ] && printf "  %-20s = %s\n" "$(basename "$f")" "$(cat "$f" 2>/dev/null)"
+        done
+      } >> "$TMPDIR/gpu/amd/amdgpu-hwmon"
+    done 2>/dev/null
+
+    # rocm-smi / amd-smi output (prefer host binary; fall back to any AMD GPU
+    # operator or workload pod). ROCm installs its tooling into a versioned
+    # directory like /opt/rocm-7.2.1/bin/ that is NOT on the default PATH, so
+    # `command -v rocm-smi` / `which amd-smi` can miss binaries that clearly
+    # exist. We discover them via a globbed lookup and invoke by absolute path.
+    # amd-smi is the newer replacement for rocm-smi and is preferred when both
+    # exist; we still capture rocm-smi output where available.
+    find-rocm-tool() {
+      # Usage: find-rocm-tool <tool-name>
+      # Echoes the first existing absolute path for the tool, or nothing.
+      # Search order: PATH, well-known ROCm install dirs, then a `find` sweep
+      # of /opt (ROCm ships under /opt/rocm-<version>/, which is NOT on the
+      # default PATH, so `which` misses it). We deliberately skip container
+      # rootfs paths (/run/containerd/.../rootfs, /opt/containerd/snapshots)
+      # here — those binaries need their container's mount namespace to run;
+      # they should be invoked via `kubectl exec` instead.
+      local tool="$1" p
+      if command -v "$tool" >/dev/null 2>&1; then
+        command -v "$tool"
+        return 0
+      fi
+      for p in /opt/rocm/bin/"$tool" /opt/rocm-*/bin/"$tool" /usr/local/bin/"$tool" /usr/bin/"$tool"; do
+        [ -x "$p" ] && { echo "$p"; return 0; }
+      done
+      if command -v find >/dev/null 2>&1; then
+        p=$(timeout 15 find /opt -maxdepth 4 -type f -name "$tool" -executable \
+              -not -path '/opt/containerd/*' 2>/dev/null | head -1)
+        [ -n "$p" ] && { echo "$p"; return 0; }
+      fi
+      return 1
+    }
+
+    find-rocm-tool-in-pod() {
+      # Usage: find-rocm-tool-in-pod <ns> <pod> <tool>
+      # Echoes the first existing absolute path for the tool inside the pod.
+      # Falls back to `find /opt /usr` — ROCm ships tools under versioned
+      # /opt/rocm-<ver>/bin/ that aren't on PATH inside the container either.
+      local ns="$1" pod="$2" tool="$3"
+      timeout 20 kubectl -n "$ns" exec "$pod" -- sh -c "
+        command -v $tool 2>/dev/null && exit 0
+        for p in /opt/rocm/bin/$tool /opt/rocm-*/bin/$tool /usr/local/bin/$tool /usr/bin/$tool; do
+          [ -x \"\$p\" ] && { echo \"\$p\"; exit 0; }
+        done
+        p=\$(find /opt /usr -maxdepth 5 -type f -name $tool -executable 2>/dev/null | head -1)
+        [ -n \"\$p\" ] && { echo \"\$p\"; exit 0; }
+        exit 1
+      " 2>/dev/null
+    }
+
+    ROCM_SMI_BIN="$(find-rocm-tool rocm-smi)"
+    AMD_SMI_BIN="$(find-rocm-tool amd-smi)"
+
+    if [ -n "$ROCM_SMI_BIN" ]; then
+      techo "Running rocm-smi on host: $ROCM_SMI_BIN"
+      timeout 30 "$ROCM_SMI_BIN" -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1 || true
+      timeout 30 "$ROCM_SMI_BIN" --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1 || true
+    fi
+    if [ -n "$AMD_SMI_BIN" ]; then
+      techo "Running amd-smi on host: $AMD_SMI_BIN"
+      timeout 30 "$AMD_SMI_BIN" version > "$TMPDIR/gpu/amd/amd-smi-version.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" list > "$TMPDIR/gpu/amd/amd-smi-list.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" static > "$TMPDIR/gpu/amd/amd-smi-static.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" metric > "$TMPDIR/gpu/amd/amd-smi-metric.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" firmware > "$TMPDIR/gpu/amd/amd-smi-firmware.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" bad-pages > "$TMPDIR/gpu/amd/amd-smi-bad-pages.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" topology > "$TMPDIR/gpu/amd/amd-smi-topology.txt" 2>&1 || true
+    fi
+
+    # If neither is on the host, try inside any candidate pod.
+    if [ -z "$ROCM_SMI_BIN" ] && [ -z "$AMD_SMI_BIN" ] && kubectl version >/dev/null 2>&1; then
+      # rocm-smi / amd-smi live inside GPU-workload containers, not on Kairos
+      # hosts. Try any pod in amd-gpu-operator, then any running vLLM/engine
+      # pod in launchpad-ai. All kubectl exec calls are timeout-guarded.
+      for NS in amd-gpu-operator launchpad-ai; do
+        for CAND in $(timeout 10 kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
+          POD_ROCM_SMI="$(find-rocm-tool-in-pod "$NS" "$CAND" rocm-smi)"
+          POD_AMD_SMI="$(find-rocm-tool-in-pod "$NS" "$CAND" amd-smi)"
+          if [ -n "$POD_ROCM_SMI" ] || [ -n "$POD_AMD_SMI" ]; then
+            if [ -n "$POD_ROCM_SMI" ]; then
+              techo "Collecting rocm-smi via $NS/$CAND ($POD_ROCM_SMI)"
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_ROCM_SMI" -a > "$TMPDIR/gpu/amd/rocm-smi-all.txt" 2>&1 || echo "(rocm-smi -a via kubectl timed out or failed)" >> "$TMPDIR/gpu/amd/rocm-smi-all.txt"
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_ROCM_SMI" --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios > "$TMPDIR/gpu/amd/rocm-smi-detail.txt" 2>&1 || echo "(rocm-smi --show* via kubectl timed out or failed)" >> "$TMPDIR/gpu/amd/rocm-smi-detail.txt"
+            fi
+            if [ -n "$POD_AMD_SMI" ]; then
+              techo "Collecting amd-smi via $NS/$CAND ($POD_AMD_SMI)"
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" version > "$TMPDIR/gpu/amd/amd-smi-version.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" list > "$TMPDIR/gpu/amd/amd-smi-list.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" static > "$TMPDIR/gpu/amd/amd-smi-static.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" metric > "$TMPDIR/gpu/amd/amd-smi-metric.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" firmware > "$TMPDIR/gpu/amd/amd-smi-firmware.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" bad-pages > "$TMPDIR/gpu/amd/amd-smi-bad-pages.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" topology > "$TMPDIR/gpu/amd/amd-smi-topology.txt" 2>&1 || true
+            fi
+            break 2
+          fi
+        done
+      done
+    fi
+
+    if [ -z "$ROCM_SMI_BIN" ] && [ -z "$AMD_SMI_BIN" ] && [ ! -s "$TMPDIR/gpu/amd/rocm-smi-all.txt" ] && [ ! -s "$TMPDIR/gpu/amd/amd-smi-list.txt" ]; then
+      echo "rocm-smi / amd-smi not found on host or in any candidate pod (amd-gpu-operator/launchpad-ai). Searched: PATH, /opt/rocm/bin, /opt/rocm-*/bin, /usr/local/bin, /usr/bin." > "$TMPDIR/gpu/amd/rocm-smi-status"
+    fi
+
+    # devcoredumps (preserved by /oem udev rule — see launchpad-ai PRs #512, #530)
+    if [ -d /var/log/amdgpu-devcoredump ]; then
+      techo "Collecting AMD GPU devcoredumps"
+      mkdir -p "$TMPDIR/gpu/amd/devcoredump"
+      cp -p /var/log/amdgpu-devcoredump/*.bin "$TMPDIR/gpu/amd/devcoredump/" 2>/dev/null || true
+      ls -la /var/log/amdgpu-devcoredump/ > "$TMPDIR/gpu/amd/devcoredump/listing" 2>&1
+    fi
+
+    # Any live devcoredumps still sitting in /sys (not yet freed by kernel)
+    if [ -d /sys/class/devcoredump ]; then
+      ls -la /sys/class/devcoredump/ > "$TMPDIR/gpu/amd/sys-devcoredump-listing" 2>&1
+    fi
+  fi
+
+  # --- NVIDIA (nvidia driver) ---
+  if [ -e /proc/driver/nvidia ] || command -v nvidia-smi >/dev/null 2>&1; then
+    techo "Collecting NVIDIA GPU info"
+    mkdir -p "$TMPDIR/gpu/nvidia"
+
+    if [ -e /proc/driver/nvidia/version ]; then
+      cat /proc/driver/nvidia/version > "$TMPDIR/gpu/nvidia/driver-version" 2>&1
+    fi
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      timeout 20 nvidia-smi -q > "$TMPDIR/gpu/nvidia/nvidia-smi-query.txt" 2>&1 || echo "(nvidia-smi -q timed out or failed)" >> "$TMPDIR/gpu/nvidia/nvidia-smi-query.txt"
+      timeout 10 nvidia-smi > "$TMPDIR/gpu/nvidia/nvidia-smi.txt" 2>&1 || true
+      timeout 15 nvidia-smi topo -m > "$TMPDIR/gpu/nvidia/nvidia-smi-topo.txt" 2>&1 || true
+      timeout 15 nvidia-smi --query-gpu=index,name,pci.bus_id,vbios_version,driver_version,pstate,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.used,ecc.errors.corrected.aggregate.total,ecc.errors.uncorrected.aggregate.total --format=csv > "$TMPDIR/gpu/nvidia/nvidia-smi-summary.csv" 2>&1 || true
+    elif kubectl version >/dev/null 2>&1; then
+      # Try NVIDIA GPU operator's driver/validator pod, then any running vLLM
+      for NS in gpu-operator launchpad-ai; do
+        for CAND in $(timeout 10 kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
+          if timeout 10 kubectl -n "$NS" exec "$CAND" -- which nvidia-smi >/dev/null 2>&1; then
+            techo "Collecting nvidia-smi via $NS/$CAND"
+            timeout 30 kubectl -n "$NS" exec "$CAND" -- nvidia-smi -q > "$TMPDIR/gpu/nvidia/nvidia-smi-query.txt" 2>&1 || true
+            timeout 20 kubectl -n "$NS" exec "$CAND" -- nvidia-smi topo -m > "$TMPDIR/gpu/nvidia/nvidia-smi-topo.txt" 2>&1 || true
+            break 2
+          fi
+        done
+      done
+    fi
+
+    # nvidia-bug-report.sh — NVIDIA driver's built-in diagnostic collector.
+    # Ships in the nvidia-utils/driver package. On Palette NVIDIA appliances
+    # the driver + userspace tools live inside the GPU Operator's driver
+    # DaemonSet container, NOT on the host (Kairos is minimal). So: try the
+    # host binary first, then fall back to kubectl exec into any pod in
+    # gpu-operator or launchpad-ai that has the tool.
+    # Read-only from a system perspective (only writes to its output file);
+    # hard 180s cap because it can hang on a wedged GPU.
+    NVIDIA_BUG_REPORT_CAPTURED=0
+    if command -v nvidia-bug-report.sh >/dev/null 2>&1; then
+      techo "Running nvidia-bug-report.sh on host (bounded at 180s)"
+      if timeout 180 sh -c "cd '$TMPDIR/gpu/nvidia' && nvidia-bug-report.sh --output-file nvidia-bug-report.log.gz" >/dev/null 2>&1; then
+        NVIDIA_BUG_REPORT_CAPTURED=1
+      fi
+    fi
+    if [ "$NVIDIA_BUG_REPORT_CAPTURED" = "0" ] && kubectl version >/dev/null 2>&1; then
+      # Fallback: exec inside any driver / validator / vLLM pod that ships
+      # the tool. Stream the .gz back over stdout so we don't need kubectl cp
+      # or an in-pod cleanup step.
+      for NS in gpu-operator launchpad-ai; do
+        for CAND in $(timeout 10 kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
+          if timeout 10 kubectl -n "$NS" exec "$CAND" -- sh -c 'command -v nvidia-bug-report.sh' >/dev/null 2>&1; then
+            techo "Running nvidia-bug-report.sh via $NS/$CAND (bounded at 180s)"
+            if timeout 180 kubectl -n "$NS" exec "$CAND" -- sh -c 'nvidia-bug-report.sh --output-file /tmp/nvidia-bug-report-sb.log.gz >/dev/null 2>&1 && cat /tmp/nvidia-bug-report-sb.log.gz && rm -f /tmp/nvidia-bug-report-sb.log.gz' > "$TMPDIR/gpu/nvidia/nvidia-bug-report.log.gz" 2>/dev/null; then
+              # Sanity check: empty file = something went wrong
+              if [ -s "$TMPDIR/gpu/nvidia/nvidia-bug-report.log.gz" ]; then
+                NVIDIA_BUG_REPORT_CAPTURED=1
+                break 2
+              fi
+            fi
+          fi
+        done
+      done
+    fi
+    if [ "$NVIDIA_BUG_REPORT_CAPTURED" = "0" ]; then
+      echo "nvidia-bug-report.sh not found on host or in any candidate pod (gpu-operator/launchpad-ai). Check nvidia-smi output in this dir instead." > "$TMPDIR/gpu/nvidia/nvidia-bug-report-status"
+    fi
+
+    if [ -d /var/log/nvidia-devcoredump ]; then
+      techo "Collecting NVIDIA GPU devcoredumps"
+      mkdir -p "$TMPDIR/gpu/nvidia/devcoredump"
+      cp -p /var/log/nvidia-devcoredump/*.bin "$TMPDIR/gpu/nvidia/devcoredump/" 2>/dev/null || true
+      ls -la /var/log/nvidia-devcoredump/ > "$TMPDIR/gpu/nvidia/devcoredump/listing" 2>&1
+    fi
+  fi
+
+  # --- launchpad-ai on-disk state ---
+  # Local models directory shape (do NOT copy weights — potentially hundreds of GB)
+  if [ -d /opt/data/spectrocloud/models ]; then
+    techo "Collecting launchpad-ai local models directory shape"
+    mkdir -p "$TMPDIR/gpu/launchpad-ai"
+    ls -la /opt/data/spectrocloud/models/ > "$TMPDIR/gpu/launchpad-ai/models-dir-listing" 2>&1
+    # metadata.yaml files are small (~20KB each) and describe every published
+    # variant + recipe — critical context for troubleshooting engine crashes.
+    find /opt/data/spectrocloud/models -maxdepth 3 -name metadata.yaml -type f 2>/dev/null | while read -r f; do
+      relpath=${f#/opt/data/spectrocloud/models/}
+      dest="$TMPDIR/gpu/launchpad-ai/models-metadata/$(dirname "$relpath")"
+      mkdir -p "$dest"
+      cp -p "$f" "$dest/" 2>/dev/null || true
+    done
+  fi
+}
+
+function stylus-files() {
+  if [ "$IS_EDGE_HOST" != true ]; then
+    skip "not an edge host (no /oem, /run/stylus, or /etc/spectro/environment)"
+    return 0
+  fi
+
+  techo "Collecting /oem files"
+  mkdir -p $TMPDIR/oem
+  ls -lah /oem/ > $TMPDIR/oem/files 2>&1
+  cp -prf /oem/. $TMPDIR/oem 2>&1
+
+  techo "Collecting /run/stylus files"
+  mkdir -p $TMPDIR/run/stylus
+  ls -lah /run/stylus/ > $TMPDIR/run/stylus/files 2>&1
+  cp -prf /run/stylus/* $TMPDIR/run/stylus 2>&1
+
+  techo "Collecting /usr/local/cloud-config files"
+  mkdir -p $TMPDIR/usr/local/cloud-config
+  ls -lah /usr/local/cloud-config/ > $TMPDIR/usr/local/cloud-config/files 2>&1
+  cp -prf /usr/local/cloud-config/* $TMPDIR/usr/local/cloud-config 2>&1
+
+  techo "Collecting /run/immucore files"
+  mkdir -p $TMPDIR/run/immucore
+  ls -lah /run/immucore/ > $TMPDIR/run/immucore/files 2>&1
+  cp -prf /run/immucore/* $TMPDIR/run/immucore 2>&1
+
+  # collect bundle-pkg index.json if exists
+  techo "Collecting bundle-pkg index.json if exists"
+  if [ -f "/usr/local/spectrocloud/bundle/bundle-pkg/index.json" ]; then
+    mkdir -p $TMPDIR/usr/local/spectrocloud/bundle/bundle-pkg
+    cp -p "/usr/local/spectrocloud/bundle/bundle-pkg/index.json" "$TMPDIR/usr/local/spectrocloud/bundle/bundle-pkg/" 2>&1
+    techo "Collected bundle-pkg index.json"
+  else
+    techo "bundle-pkg index.json not found at /usr/local/spectrocloud/bundle/bundle-pkg/index.json"
+  fi
+
+  # collect installer.log if exists
+  techo "Collecting installer.log if exists"
+  if [ -f "/usr/local/installer.log" ]; then
+    mkdir -p $TMPDIR/usr/local
+    cp -p "/usr/local/installer.log" "$TMPDIR/usr/local/" 2>&1
+    techo "Collected installer.log"
+  else
+    techo "installer.log not found at /usr/local/installer.log"
+  fi
+
+  # collect stylus-content-script.log if exists
+  techo "Collecting stylus-content-script.log if exists"
+  if [ -f "/usr/local/spectrocloud/stylus-content-script.log" ]; then
+    mkdir -p $TMPDIR/usr/local/spectrocloud
+    cp -p "/usr/local/spectrocloud/stylus-content-script.log" "$TMPDIR/usr/local/spectrocloud/" 2>&1
+    techo "Collected stylus-content-script.log"
+  else
+    techo "stylus-content-script.log not found at /usr/local/spectrocloud/stylus-content-script.log"
+  fi
+
+  # collect containerd config.toml if exists
+  techo "Collecting containerd config.toml if exists"
+  if [ -f "/etc/containerd/config.toml" ]; then
+    mkdir -p $TMPDIR/etc/containerd
+    cp -p "/etc/containerd/config.toml" "$TMPDIR/etc/containerd/" 2>&1
+    techo "Collected containerd config.toml"
+  else
+    techo "containerd config.toml not found at /etc/containerd/config.toml"
+  fi
+
+  # collect containerd conf.d/*.toml files if they exist
+  techo "Collecting containerd conf.d/*.toml files if they exist"
+  if [ -d "/etc/containerd/conf.d" ]; then
+    mkdir -p $TMPDIR/etc/containerd/conf.d
+    ls -lah /etc/containerd/conf.d/ > "$TMPDIR/etc/containerd/conf.d/files" 2>&1
+
+    # collect all .toml files from conf.d directory
+    for file in /etc/containerd/conf.d/*.toml; do
+      if [ -f "$file" ]; then
+        cp -p "$file" "$TMPDIR/etc/containerd/conf.d/" 2>&1
+        techo "Collected containerd config file: $(basename $file)"
+      fi
+    done
+
+    # check if any .toml files were found
+    if [ -z "$(ls -A $TMPDIR/etc/containerd/conf.d/*.toml 2>/dev/null)" ]; then
+      techo "No .toml files found in /etc/containerd/conf.d/"
+    fi
+  else
+    techo "containerd conf.d directory not found at /etc/containerd/conf.d"
+  fi
+
+  # collect bundle directory listing
+  techo "Collecting bundle directory listing"
+  if [ -d "/usr/local/spectrocloud/bundle" ]; then
+    mkdir -p $TMPDIR/usr/local/spectrocloud/bundle
+    ls -larthR /usr/local/spectrocloud/bundle/ > "$TMPDIR/usr/local/spectrocloud/bundle/directory-listing.txt" 2>&1
+    techo "Collected bundle directory listing"
+  else
+    techo "bundle directory not found at /usr/local/spectrocloud/bundle"
+  fi
+
+  # collect content from /opt/spectrocloud/bin-checksums/*
+  techo "Collecting content from /opt/spectrocloud/bin-checksums/*"
+  mkdir -p $TMPDIR/opt/spectrocloud/bin-checksums
+  for file in /opt/spectrocloud/bin-checksums/*; do
+    if [ -f "$file" ]; then
+      cp -p "$file" "$TMPDIR/opt/spectrocloud/bin-checksums" 2>&1
+    fi
+  done
+
+  #  check if sha256sum is installed, fallback to openssl
+  if command -v sha256sum >/dev/null 2>&1; then
+    CHECKSUM_CMD="sha256sum"
+  elif command -v openssl >/dev/null 2>&1; then
+    CHECKSUM_CMD="openssl dgst -sha256"
+  else
+    techo "Neither sha256sum nor openssl commands found"
+    return 0
+  fi
+
+  # collect checksums for /opt/spectrocloud/bin/*
+  techo "Collecting checksums for /opt/spectrocloud/bin/* using $CHECKSUM_CMD"
+  mkdir -p $TMPDIR/opt/spectrocloud/bin
+  for file in /opt/spectrocloud/bin/*; do
+    if [ -f "$file" ]; then
+      $CHECKSUM_CMD "$file" > "$TMPDIR/opt/spectrocloud/bin/$(basename $file).sha256" 2>&1
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# runtime — container runtime and helm collectors
+# ---------------------------------------------------------------------------
+
+function crictl-logs() {
+  if ! crictl --version >/dev/null 2>&1; then
+    skip "crictl not present"
+    return 0
+  fi
+
+  techo "Collecting crictl logs using flags ${CRICTL_FLAGS}"
+  mkdir -p "$TMPDIR/${DISTRO:-runtime}/crictl"
+  if ! crictl ps > /dev/null 2>&1; then
+    techo "[!] Containerd is offline, skipping crictl collection"
+    skip "containerd is offline"
+    return 0
+  fi
+
+  crictl ps -a > "$TMPDIR/${DISTRO:-runtime}/crictl/psa" 2>&1
+  crictl pods > "$TMPDIR/${DISTRO:-runtime}/crictl/pods" 2>&1
+  crictl info > "$TMPDIR/${DISTRO:-runtime}/crictl/info" 2>&1
+  crictl version > "$TMPDIR/${DISTRO:-runtime}/crictl/version" 2>&1
+  crictl images > "$TMPDIR/${DISTRO:-runtime}/crictl/images" 2>&1
+  crictl imagefsinfo > "$TMPDIR/${DISTRO:-runtime}/crictl/imagefsinfo" 2>&1
+  crictl stats -a > "$TMPDIR/${DISTRO:-runtime}/crictl/statsa" 2>&1
+
+  CONTAINERS=$(crictl ps -a -q)
+  mkdir -p "$TMPDIR/${DISTRO:-runtime}/crictl/logs"
+  for container_id in $CONTAINERS; do
+    container_name=$(crictl inspect "$container_id" | jq -r '.status.metadata.name' 2>/dev/null)
+    if [ -z "$container_name" ] || [ "$container_name" == "null" ]; then
+      container_name="$container_id"
+    fi
+    crictl logs $CRICTL_FLAGS "$container_id" > "$TMPDIR/${DISTRO:-runtime}/crictl/logs/${container_name}_${container_id:0:12}.log" 2>&1
+  done
+}
+
+function helm-logs() {
+  if [ -z "$HELM_BIN" ]; then
+    skip "helm binary not found (checked \$STYLUS_ROOT/opt/spectrocloud/bin/helm and PATH)"
+    return 0
+  fi
+
+  mkdir -p "$TMPDIR/helm"
+  "$HELM_BIN" list --all --all-namespaces > "$TMPDIR/helm/helm-list.log" 2>&1
+  "$HELM_BIN" repo list > "$TMPDIR/helm/helm-repo.log" 2>&1
+  "$HELM_BIN" version > "$TMPDIR/helm/helm-version.log" 2>&1
+  "$HELM_BIN" env > "$TMPDIR/helm/helm-env.log" 2>&1
+  "$HELM_BIN" plugin list > "$TMPDIR/helm/helm-plugin-list.log" 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# k8s — cluster discovery, RBAC coverage, resource collection
+# ---------------------------------------------------------------------------
+
+function spectro-k8s-defaults() {
+  if ! kubectl version >/dev/null 2>&1; then
+    skip "kubectl not usable"
+    return 0
+  fi
+
+  IS_ENTERPRISE_CLUSTER=false
+  if kubectl get ns --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null | grep -q 'hubble-system'; then
+    IS_ENTERPRISE_CLUSTER=true
+    CLUSTER_NAME="spectro-enterprise-cluster"
+    techo "This is an Enterprise cluster. Collecting logs from all namespaces"
+  fi
+
+  # PCG detection: match either deployment name (edge historically matched
+  # spectro-cloud-driver, infra matched jet), guarded by the enterprise check.
+  IS_PCG_CLUSTER=false
+  if [[ "$IS_ENTERPRISE_CLUSTER" == false ]] && kubectl get deployment -n jet-system --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null | grep -qE 'spectro-cloud-driver|jet'; then
+    IS_PCG_CLUSTER=true
+    CLUSTER_NAME="spectro-pcg-cluster"
+    techo "This is a PCG cluster. Collecting logs from all namespaces"
+  fi
+
+  if [[ "$IS_ENTERPRISE_CLUSTER" == true ]] || [[ "$IS_PCG_CLUSTER" == true ]]; then
+    SYSTEM_NAMESPACES=($(kubectl get ns --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null))
+    return 0
+  fi
+
+  # Prune namespaces that don't exist. One namespace listing, and rebuild the
+  # array instead of unsetting entries inside a nested loop (which was O(n²)
+  # and left a sparse array).
+  local EXISTING_NS PRUNED=()
+  EXISTING_NS=$(kubectl get ns --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null)
+  for NS in "${SYSTEM_NAMESPACES[@]}"; do
+    if grep -qx "$NS" <<< "$EXISTING_NS"; then
+      PRUNED+=("$NS")
+    else
+      techo "Namespace $NS not found in the cluster. Removing from the list."
+    fi
+  done
+  SYSTEM_NAMESPACES=("${PRUNED[@]}")
+
+  CLUSTER_NSS=$(kubectl get ns --output=custom-columns="Name:.metadata.name" --no-headers -l 'spectrocloud.com/cluster-name' 2>/dev/null)
+  if [[ -z "${CLUSTER_NSS}" ]]; then
+    CLUSTER_NSS=$(kubectl get ns -o=name | grep '^namespace/cluster-' | sed "s/^.\{10\}//")
+  fi
+
+  if [[ -z "${CLUSTER_NSS}" ]]; then
+    techo "Palette cluster namespace is empty."
+  else
+    for NS in $(echo $CLUSTER_NSS | tr " " "\n"); do
+      techo "Adding namespace $NS for logs collection."
+      SYSTEM_NAMESPACES+=("$NS")
+
+      if [[ "$NS" =~ [0-9a-fA-F\-]{8,} ]]; then
+        CLUSTER_NS="$NS"
+        techo "Cluster namespace: $CLUSTER_NS"
+      fi
+    done
+  fi
+
+  SYSTEM_UPGRADE_UUID_NS=$(kubectl get ns -o=name | grep '^namespace/system-upgrade-' | sed "s/^.\{10\}//")
+  if [[ -z "${SYSTEM_UPGRADE_UUID_NS}" ]]; then
+    techo "System upgrade UUID namespace is empty."
+  else
+    for NS in $(echo $SYSTEM_UPGRADE_UUID_NS | tr " " "\n"); do
+      techo "Adding namespace $NS for logs collection."
+      SYSTEM_NAMESPACES+=("$NS")
+    done
+  fi
+
+  SPECTRO_TASK_NS=$(kubectl get ns -o=name | grep '^namespace/spectro-task-' | sed "s/^.\{10\}//")
+  if [[ -z "${SPECTRO_TASK_NS}" ]]; then
+    techo "Spectro task UUID namespace is empty."
+  else
+    for NS in $(echo $SPECTRO_TASK_NS | tr " " "\n"); do
+      techo "Adding namespace $NS for logs collection."
+      SYSTEM_NAMESPACES+=("$NS")
+    done
+  fi
+
+  CLUSTER_NAME=$(kubectl get spc -n "${CLUSTER_NS}" --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null)
+  if [[ -z "${CLUSTER_NAME}" ]]; then
+    techo "Cluster name is empty. Please check if the cluster is registered with Palette"
+    CLUSTER_NAME="spectro-cluster"
+  fi
+}
+
+function can-i-list() {
+  local RESOURCE="$1"
+  local NS="${2:-}"
+  if [[ -n "$NS" ]]; then
+    [[ "$(kubectl auth can-i list "$RESOURCE" -n "$NS" 2>/dev/null)" == "yes" ]]
+  else
+    [[ "$(kubectl auth can-i list "$RESOURCE" 2>/dev/null)" == "yes" ]]
+  fi
+}
+
+function can-list-pods-in-namespace() {
+  local NS="$1"
+  can-i-list pods "$NS"
+}
+
+function rbac-error-message() {
+  local NS_LIST="$*"
+  cat <<EOF
+WARNING: Cannot list pods in namespace(s): ${NS_LIST}
+
+The user running this script does not have permission to list pods in one or
+more targeted namespaces. Support bundles require pod access for meaningful
+diagnostics.
+
+Action: Check the ClusterRole or Role attached to the user or service account
+        running this script. Ensure it grants at least 'list' (and 'get') on
+        pods in the affected namespaces, for example:
+
+          rules:
+          - apiGroups: [""]
+            resources: [pods]
+            verbs: [get, list]
+
+Continuing with a partial bundle; denied namespaces are recorded in
+namespace-coverage.txt and collection-summary.txt.
+EOF
+}
+
+function cluster-rbac-error-message() {
+  local RESOURCE_LIST="$*"
+  cat <<EOF
+WARNING: Cannot list cluster-scoped resource(s): ${RESOURCE_LIST}
+
+The user running this script does not have permission to list one or more
+cluster-scoped resources required for a complete support bundle.
+
+Action: Check the ClusterRole attached to the user or service account running
+        this script. Ensure it grants at least 'list' (and 'get') on the denied
+        resources, for example:
+
+          rules:
+          - apiGroups: [""]
+            resources: [namespaces, nodes]
+            verbs: [get, list]
+          - apiGroups: [apiextensions.k8s.io]
+            resources: [customresourcedefinitions]
+            verbs: [get, list]
+
+Continuing with a partial bundle; denied resources are recorded in
+namespace-coverage.txt and collection-summary.txt.
+EOF
+}
+
+# Advisory RBAC coverage: prune inaccessible namespaces, record DENIED, print
+# remediation, and always continue — a partial bundle beats no bundle.
+function validate-namespace-coverage() {
+  local -a COLLECT_NAMESPACES=()
+  local -a SKIPPED_NAMESPACES=()
+  local -a RBAC_FAILURES=()
+  local -a CLUSTER_RBAC_OK=()
+  local -a CLUSTER_RBAC_FAILURES=()
+  local -a REQUIRED_CLUSTER_LIST=(
+    namespaces
+    nodes
+    customresourcedefinitions.apiextensions.k8s.io
+  )
+  local NS REASON RESOURCE ENTRY
+
+  for RESOURCE in "${REQUIRED_CLUSTER_LIST[@]}"; do
+    if can-i-list "$RESOURCE"; then
+      CLUSTER_RBAC_OK+=("$RESOURCE")
+    else
+      CLUSTER_RBAC_FAILURES+=("$RESOURCE")
+    fi
+  done
+
+  for NS in "${SYSTEM_NAMESPACES[@]}"; do
+    if ! kubectl get ns "$NS" >/dev/null 2>&1; then
+      SKIPPED_NAMESPACES+=("${NS}|namespace not found")
+      continue
+    fi
+
+    if ! can-list-pods-in-namespace "$NS"; then
+      RBAC_FAILURES+=("$NS")
+      continue
+    fi
+
+    COLLECT_NAMESPACES+=("$NS")
+  done
+
+  {
+    echo "RBAC / Namespace Coverage Summary"
+    echo "Generated: $(timestamp)"
+    echo ""
+    echo "Cluster-scoped permissions"
+    printf "%-12s %-50s %s\n" "STATUS" "RESOURCE" "NOTES"
+    printf "%-12s %-50s %s\n" "------" "--------" "-----"
+    for RESOURCE in "${CLUSTER_RBAC_OK[@]}"; do
+      printf "%-12s %-50s %s\n" "ALLOWED" "$RESOURCE" "can list"
+    done
+    for RESOURCE in "${CLUSTER_RBAC_FAILURES[@]}"; do
+      printf "%-12s %-50s %s\n" "DENIED" "$RESOURCE" "cannot list (RBAC)"
+    done
+    echo ""
+    echo "Namespace coverage"
+    printf "%-12s %-40s %s\n" "STATUS" "NAMESPACE" "NOTES"
+    printf "%-12s %-40s %s\n" "------" "---------" "-----"
+    for NS in "${COLLECT_NAMESPACES[@]}"; do
+      printf "%-12s %-40s %s\n" "COLLECT" "$NS" "accessible"
+    done
+    for ENTRY in "${SKIPPED_NAMESPACES[@]}"; do
+      NS="${ENTRY%%|*}"
+      REASON="${ENTRY#*|}"
+      printf "%-12s %-40s %s\n" "SKIP" "$NS" "$REASON"
+    done
+    for NS in "${RBAC_FAILURES[@]}"; do
+      printf "%-12s %-40s %s\n" "DENIED" "$NS" "cannot list pods (RBAC)"
+    done
+    echo ""
+    echo "Cluster resources allowed: ${#CLUSTER_RBAC_OK[@]}"
+    echo "Cluster resources denied:  ${#CLUSTER_RBAC_FAILURES[@]}"
+    echo "Namespaces to collect:     ${#COLLECT_NAMESPACES[@]}"
+    echo "Namespaces skipped:        ${#SKIPPED_NAMESPACES[@]}"
+    if [[ ${#RBAC_FAILURES[@]} -gt 0 ]]; then
+      echo "Namespaces denied:         ${#RBAC_FAILURES[@]}"
+    fi
+  } | tee "${TMPDIR}/namespace-coverage.txt"
+
+  techo "Namespace coverage summary written to namespace-coverage.txt"
+
+  local NOTES=()
+  if [[ ${#CLUSTER_RBAC_FAILURES[@]} -gt 0 ]]; then
+    cluster-rbac-error-message "${CLUSTER_RBAC_FAILURES[*]}"
+    record-status DENIED "k8s/rbac/cluster-scoped" "cannot list: ${CLUSTER_RBAC_FAILURES[*]}"
+    NOTES+=("${#CLUSTER_RBAC_FAILURES[@]} cluster-scoped denied")
+  fi
+
+  if [[ ${#RBAC_FAILURES[@]} -gt 0 ]]; then
+    rbac-error-message "${RBAC_FAILURES[*]}"
+    record-status DENIED "k8s/rbac/namespaces" "cannot list pods in: ${RBAC_FAILURES[*]}"
+    NOTES+=("${#RBAC_FAILURES[@]} namespaces denied")
+  fi
+
+  if [[ ${#COLLECT_NAMESPACES[@]} -eq 0 ]]; then
+    techo "WARNING: No namespaces available for collection after coverage validation."
+    techo "Action: Verify cluster access and that at least one targeted namespace exists and is accessible."
+    STEP_STATUS=FAIL
+    STEP_NOTE="no accessible namespaces"
+  elif [[ ${#NOTES[@]} -gt 0 ]]; then
+    STEP_NOTE="$(IFS='; '; echo "${NOTES[*]}")"
+  fi
+
+  SYSTEM_NAMESPACES=("${COLLECT_NAMESPACES[@]}")
+}
+
+function k8s-resources() {
+  if ! kubectl version >/dev/null 2>&1; then
+    skip "kubectl not usable"
+    return 0
+  fi
+
+  techo "Collecting logs from following namespaces: ${SYSTEM_NAMESPACES[*]}"
+
+  techo "Collecting k8s cluster-info"
+  mkdir -p "${TMPDIR}/k8s/cluster-info"
+  kubectl version -o yaml > "${TMPDIR}/k8s/cluster-info/cluster-version.yaml" 2>&1
+  kubectl cluster-info > "${TMPDIR}/k8s/cluster-info/cluster-info" 2>&1
+
+  techo "Collecting k8s cluster-info dump"
+  mkdir -p "${TMPDIR}/k8s/cluster-info/dump"
+  kubectl cluster-info dump --namespaces "$(IFS=,; echo "${SYSTEM_NAMESPACES[*]}")" --output-directory="${TMPDIR}/k8s/cluster-info/dump" --output=yaml 2>&1
+  kubectl api-resources -o wide > "${TMPDIR}/k8s/cluster-info/api-resources" 2>&1
+
+  techo "Collecting k8s resources"
+  mkdir -p "${TMPDIR}/k8s/cluster-resources"
+  for RESOURCE in "${API_RESOURCES[@]}"; do
+    [ "$QUIET" = true ] || printf "\rCollecting k8s resource: %-50s" "${RESOURCE}"
+    kubectl get "$RESOURCE" --all-namespaces --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/${RESOURCE}.yaml" 2>&1
+  done
+  [ "$QUIET" = true ] || printf "\n"
+
+  techo "Collecting k8s namespaced resources"
+  for RESOURCE in "${API_RESOURCES_NAMESPACED[@]}"; do
+    mkdir -p "${TMPDIR}/k8s/cluster-resources/${RESOURCE}"
+    [ "$QUIET" = true ] || printf "\rCollecting k8s namespaced resource: %-50s" "${RESOURCE}"
+    for NS in "${SYSTEM_NAMESPACES[@]}"; do
+      kubectl get "$RESOURCE" -n "$NS" --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/${RESOURCE}/${NS}.yaml" 2>&1
+    done
+  done
+  [ "$QUIET" = true ] || printf "\n"
+
+  techo "Collecting helm release secrets"
+  mkdir -p "${TMPDIR}/k8s/cluster-resources/secrets"
+  for NS in "${SYSTEM_NAMESPACES[@]}"; do
+    kubectl get secret -n "$NS" --field-selector type=helm.sh/release.v1 --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/secrets/${NS}.yaml" 2>&1
+  done
+
+  techo "Collecting k8s custom-resources"
+  mkdir -p "${TMPDIR}/k8s/cluster-resources/custom-resources"
+
+  techo "Collecting k8s cluster-scoped custom-resources"
+  CLUSTER_CRDS=$(kubectl get crd -o custom-columns=NAME:.metadata.name,SCOPE:.spec.scope --no-headers | grep "Cluster" | awk '{print $1}')
+  for CRD in $CLUSTER_CRDS; do
+    COUNT=$(kubectl get "$CRD" --no-headers 2>/dev/null | wc -l | xargs)
+    if [ $COUNT -gt 0 ]; then
+      [ "$QUIET" = true ] || printf "\rCollecting k8s cluster-scoped custom-resource: %-50s" "${CRD}"
+      kubectl get "$CRD" --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}.yaml" 2>&1
+    fi
+  done
+  [ "$QUIET" = true ] || printf "\n"
+
+  techo "Collecting k8s namespace-scoped custom-resources"
+  NAMESPACED_CRDS=$(kubectl get crd -o custom-columns=NAME:.metadata.name,SCOPE:.spec.scope --no-headers | grep "Namespaced" | awk '{print $1}')
+  for CRD in $NAMESPACED_CRDS; do
+    ALL_COUNT=$(kubectl get "$CRD" -A --no-headers 2>/dev/null | wc -l | xargs)
+    if [ $ALL_COUNT -gt 0 ]; then
+      [ "$QUIET" = true ] || printf "\rCollecting k8s namespace-scoped custom-resource: %-50s" "${CRD}"
+      for NS in "${SYSTEM_NAMESPACES[@]}"; do
+        COUNT=$(kubectl get "$CRD" -n "$NS" --no-headers 2>/dev/null | wc -l | xargs)
+        if [ $COUNT -gt 0 ]; then
+          mkdir -p "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}"
+          kubectl get "$CRD" -n "$NS" --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/custom-resources/${CRD}/${NS}.yaml" 2>&1
+        fi
+      done
+    fi
+  done
+  [ "$QUIET" = true ] || printf "\n"
+
+  techo "Collecting k8s metrics"
+  mkdir -p "${TMPDIR}/k8s/metrics"
+  kubectl top nodes > "${TMPDIR}/k8s/metrics/nodes-metrics" 2>&1
+  kubectl top pods --all-namespaces > "${TMPDIR}/k8s/metrics/pods-metrics" 2>&1
+  kubectl top pods --all-namespaces --containers > "${TMPDIR}/k8s/metrics/pods-containers-metrics" 2>&1
+
+  techo "Collecting logs from previous pods"
+  mkdir -p "${TMPDIR}/k8s/previous-pod-logs"
+  for NS in "${SYSTEM_NAMESPACES[@]}"; do
+    for POD in $(kubectl get pods -n "$NS" --no-headers -o custom-columns="NAME:.metadata.name"); do
+      LOGS=$(kubectl logs -n "$NS" "$POD" --all-containers --previous 2>&1)
+      if [[ -n "$LOGS" ]]; then
+        mkdir -p "${TMPDIR}/k8s/previous-pod-logs/${NS}/${POD}"
+        echo "$LOGS" > "${TMPDIR}/k8s/previous-pod-logs/${NS}/${POD}/previous.log"
+      fi
+    done
+  done
+}
+
+function mongo-status() {
+  if [[ "$IS_ENTERPRISE_CLUSTER" != true ]]; then
+    skip "not an Enterprise cluster"
+    return 0
+  fi
+
+  techo "Collecting MongoDB status"
+  mkdir -p "${TMPDIR}/mongo"
+
+  # Find all running mongo pods
+  MONGO_PODS=$(kubectl get pods -n hubble-system --field-selector=status.phase=Running -o custom-columns="NAME:.metadata.name" --no-headers | grep mongo)
+
+  if [[ -z "$MONGO_PODS" ]]; then
+    echo "No running MongoDB pods found in hubble-system namespace" > "${TMPDIR}/mongo/status.txt"
+    return 0
+  fi
+
+  # Use first pod to detect mongo shell and auth method
+  FIRST_POD=$(echo "$MONGO_PODS" | head -1)
+
+  # Try mongosh first, fall back to mongo for older versions (use full path)
+  if kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongosh >/dev/null 2>&1; then
+    MONGO_CMD=$(kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongosh 2>/dev/null)
+  elif kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongo >/dev/null 2>&1; then
+    MONGO_CMD=$(kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- which mongo 2>/dev/null)
+  else
+    techo "Neither mongosh nor mongo command found in pod"
+    echo "Neither mongosh nor mongo command found in pod" > "${TMPDIR}/mongo/status.txt"
+    return 0
+  fi
+  techo "Using MongoDB shell: $MONGO_CMD"
+
+  # Check if TLS is enabled (VerteX EC cluster)
+  if kubectl exec -n hubble-system "$FIRST_POD" -c mongo -- test -f /var/mongodb/tls/ca.crt 2>/dev/null; then
+    techo "Detected VerteX EC cluster (TLS enabled)"
+    MONGO_AUTH='-u $MONGODB_INITDB_ROOT_USERNAME -p $MONGODB_INITDB_ROOT_PASSWORD --host $HOSTNAME --tls --tlsCAFile /var/mongodb/tls/ca.crt --tlsCertificateKeyFile /var/mongodb/tls/tls-combined.pem --tlsAllowInvalidHostnames'
+  else
+    techo "Detected standard EC cluster"
+    DB_PASSWORD=$(kubectl get secret spectromongosecret -o jsonpath="{.data.mongoRootPassword}" -n hubble-system 2>/dev/null | base64 -d 2>/dev/null)
+    if [[ -z "$DB_PASSWORD" ]]; then
+      echo "Failed to retrieve MongoDB password" > "${TMPDIR}/mongo/status.txt"
+      return 0
+    fi
+    MONGO_AUTH="-u root -p $DB_PASSWORD --authenticationDatabase admin"
+  fi
+
+  # Find a pod that's part of the replica set
+  MONGO_POD=""
+  for POD in $MONGO_PODS; do
+    techo "Trying MongoDB pod: $POD"
+    if kubectl exec -n hubble-system "$POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'rs.status()'" >/dev/null 2>&1; then
+      MONGO_POD="$POD"
+      techo "Using MongoDB pod: $MONGO_POD (replica set member)"
+      break
+    fi
+    techo "Pod $POD is not a replica set member, trying next..."
+  done
+
+  if [[ -z "$MONGO_POD" ]]; then
+    echo "No MongoDB pods found that are part of the replica set" > "${TMPDIR}/mongo/status.txt"
+    return 0
+  fi
+
+  techo "Collecting MongoDB replica set status"
+  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'JSON.stringify(rs.status(), null, 2)'" > "${TMPDIR}/mongo/rs-status.json" 2>&1
+
+  techo "Collecting MongoDB replica set configuration"
+  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'JSON.stringify(rs.conf(), null, 2)'" > "${TMPDIR}/mongo/rs-conf.json" 2>&1
+
+  techo "Collecting MongoDB replication info"
+  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval 'rs.printReplicationInfo()'" > "${TMPDIR}/mongo/replication-info.txt" 2>&1
+
+  techo "Collecting MongoDB per-pod disk usage (df)"
+  : > "${TMPDIR}/mongo/disk-usage.txt"
+  while IFS= read -r POD; do
+    [ -n "$POD" ] || continue
+    {
+      echo "== $POD =="
+      kubectl exec -n hubble-system "$POD" -c mongo -- df -h /var/lib/mongodb 2>&1
+      echo
+    } >> "${TMPDIR}/mongo/disk-usage.txt"
+  done < <(printf '%s\n' "$MONGO_PODS")
+
+  techo "Collecting MongoDB database + collection sizes"
+  kubectl exec -n hubble-system "$MONGO_POD" -c mongo -- bash -c "$MONGO_CMD $MONGO_AUTH admin --quiet --eval '
+    db.adminCommand({listDatabases:1}).databases.forEach(function(d){
+      var s = db.getSiblingDB(d.name).stats(1024*1024);
+      print(\"DB \"+d.name+\" storageSize(MB)=\"+s.storageSize+\" dataSize(MB)=\"+s.dataSize);
+      db.getSiblingDB(d.name).getCollectionNames().forEach(function(c){
+        var cs = db.getSiblingDB(d.name).getCollection(c).stats(1024*1024);
+        print(\"  \"+d.name+\".\"+c+\" storageSize(MB)=\"+cs.storageSize+\" size(MB)=\"+cs.size+\" count=\"+cs.count);
+      });
+    });'" > "${TMPDIR}/mongo/db-collection-sizes.txt" 2>&1
+}
+
+function var-log-pods() {
+  techo "Collecting k8s pod logs"
+  mkdir -p "${TMPDIR}/k8s/pod-logs"
+  for NS in "${SYSTEM_NAMESPACES[@]}"; do
+    # compgen guards the glob: cp errors noisily when nothing matches
+    if compgen -G "/var/log/pods/${NS}*" > /dev/null; then
+      cp -prf /var/log/pods/"$NS"* "${TMPDIR}/k8s/pod-logs" 2>&1
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# distro — distribution-specific host state
+# ---------------------------------------------------------------------------
+
+function opt-kubeadm-files() {
+  if [ ! -d /opt/kubeadm ]; then
+    skip "/opt/kubeadm does not exist"
+    return 0
+  fi
+
+  techo "Collecting files from /opt/kubeadm"
+  mkdir -p $TMPDIR/opt/kubeadm
+  ls -lah /opt/kubeadm/ > $TMPDIR/opt/kubeadm/files 2>&1
+  cp -p /opt/kubeadm/* $TMPDIR/opt/kubeadm 2>/dev/null
+}
+
+function kubeadm-manifests() {
+  if [ ! -d /etc/kubernetes/manifests ]; then
+    skip "/etc/kubernetes/manifests does not exist"
+    return 0
+  fi
+
+  techo "Collecting static manifests from /etc/kubernetes/manifests"
+  mkdir -p $TMPDIR/etc/kubernetes/manifests
+  ls -lah /etc/kubernetes/manifests/ > $TMPDIR/etc/kubernetes/manifests/files 2>&1
+  cp -p /etc/kubernetes/manifests/* $TMPDIR/etc/kubernetes/manifests 2>&1
+
+  if ! command -v kubeadm >/dev/null 2>&1; then
+    techo "kubeadm-manifests: kubeadm command not found"
+    return 0
+  fi
+  kubeadm version -o yaml > $TMPDIR/etc/kubernetes/kubeadm-version.yaml 2>&1
+}
+
+function kubeadm-certs() {
+  if ! command -v openssl >/dev/null 2>&1; then
+    skip "openssl not present"
+    return 0
+  fi
+
+  if [ -d /etc/kubernetes/pki/ ]
+    then
+      techo "Collecting k8s kubeadm directory state"
+      mkdir -p $TMPDIR/etc/kubernetes/pki/{server,kubelet}
+
+      ls -lah /etc/kubernetes/ > $TMPDIR/etc/kubernetes/files 2>&1
+
+      techo "Collecting k8s kubeadm certificates"
+      SERVER_CERTS=$(find /etc/kubernetes/pki/ -maxdepth 2 -type f -name "*.crt" | grep -v "\-ca.crt$")
+      for CERT in $SERVER_CERTS
+        do
+          openssl x509 -in $CERT -text -noout > $TMPDIR/etc/kubernetes/pki/server/$(basename $CERT) 2>&1
+      done
+      if [ -d /var/lib/kubelet/pki/ ]; then
+        techo "Collecting kubelet certificates"
+        AGENT_CERTS=$(find /var/lib/kubelet/pki/ -maxdepth 2 -type f -name "*.crt" | grep -v "\-ca.crt$")
+        for CERT in $AGENT_CERTS
+          do
+            openssl x509 -in $CERT -text -noout > $TMPDIR/etc/kubernetes/pki/kubelet/$(basename $CERT) 2>&1
+        done
+      fi
+  fi
+}
+
+function kubeadm-etcd() {
+  KUBEADM_ETCD_DIR="/etc/kubernetes"
+  KUBEADM_ETCD_CERTS="/etc/kubernetes/pki/etcd/"
+
+  if ! command -v etcdctl >/dev/null 2>&1; then
+    skip "etcdctl not present"
+    return 0
+  fi
+
+  if [ -d $KUBEADM_ETCD_DIR ]; then
+    techo "Collecting kubeadm etcd info"
+    mkdir -p $TMPDIR/etcd
+    ETCDCTL_ENDPOINTS=$(etcdctl --cert ${KUBEADM_ETCD_CERTS}/server.crt --key ${KUBEADM_ETCD_CERTS}/server.key --cacert ${KUBEADM_ETCD_CERTS}/ca.crt --write-out="simple" endpoint status | cut -d "," -f 1)
+
+    etcdctl version > $TMPDIR/etcd/version 2>&1
+    etcdctl --endpoints=$ETCDCTL_ENDPOINTS --cert ${KUBEADM_ETCD_CERTS}/server.crt --key ${KUBEADM_ETCD_CERTS}/server.key --cacert ${KUBEADM_ETCD_CERTS}/ca.crt --write-out table endpoint status > $TMPDIR/etcd/endpointstatus 2>&1
+    etcdctl --endpoints=$ETCDCTL_ENDPOINTS --cert ${KUBEADM_ETCD_CERTS}/server.crt --key ${KUBEADM_ETCD_CERTS}/server.key --cacert ${KUBEADM_ETCD_CERTS}/ca.crt endpoint health > $TMPDIR/etcd/endpointhealth 2>&1
+    etcdctl --endpoints=$ETCDCTL_ENDPOINTS --cert ${KUBEADM_ETCD_CERTS}/server.crt --key ${KUBEADM_ETCD_CERTS}/server.key --cacert ${KUBEADM_ETCD_CERTS}/ca.crt alarm list > $TMPDIR/etcd/alarmlist 2>&1
+    etcdctl --endpoints=$ETCDCTL_ENDPOINTS --cert ${KUBEADM_ETCD_CERTS}/server.crt --key ${KUBEADM_ETCD_CERTS}/server.key --cacert ${KUBEADM_ETCD_CERTS}/ca.crt member list --write-out table > $TMPDIR/etcd/memberlist 2>&1
+
+    etcdctl --endpoints=$ETCDCTL_ENDPOINTS --cert ${KUBEADM_ETCD_CERTS}/server.crt --key ${KUBEADM_ETCD_CERTS}/server.key --cacert ${KUBEADM_ETCD_CERTS}/ca.crt --write-out table endpoint status --cluster > $TMPDIR/etcd/cluster_endpointstatus 2>&1
+  fi
+
+  if [ -d ${KUBEADM_ETCD_DIR} ]; then
+    find ${KUBEADM_ETCD_DIR} -type f -exec ls -la {} \; > $TMPDIR/etcd/findserverdbetcd 2>&1
+  fi
+}
+
+function rke2-certs() {
+  if [ -d ${RKE2_DATA_DIR} ]
+    then
+      techo "Collecting rke2 directory state"
+      mkdir -p $TMPDIR/${DISTRO:-rke2}/directories
+      ls -lah ${RKE2_DATA_DIR}/agent > $TMPDIR/${DISTRO:-rke2}/directories/rke2agent 2>&1
+      ls -lahR ${RKE2_DATA_DIR}/server/manifests > $TMPDIR/${DISTRO:-rke2}/directories/rke2servermanifests 2>&1
+      ls -lahR ${RKE2_DATA_DIR}/server/tls > $TMPDIR/${DISTRO:-rke2}/directories/rke2servertls 2>&1
+      techo "Collecting rke2 certificates"
+      mkdir -p $TMPDIR/${DISTRO:-rke2}/certs/{agent,server}
+      AGENT_CERTS=$(find ${RKE2_DATA_DIR}/agent -maxdepth 1 -type f -name "*.crt" | grep -v "\-ca.crt$")
+      for CERT in $AGENT_CERTS
+        do
+          openssl x509 -in $CERT -text -noout > $TMPDIR/${DISTRO:-rke2}/certs/agent/$(basename $CERT) 2>&1
+      done
+      if [ -d ${RKE2_DATA_DIR}/server/tls ]; then
+        techo "Collecting rke2 server certificates"
+        SERVER_CERTS=$(find ${RKE2_DATA_DIR}/server/tls -maxdepth 1 -type f -name "*.crt" | grep -v "\-ca.crt$")
+        for CERT in $SERVER_CERTS
+          do
+            openssl x509 -in $CERT -text -noout > $TMPDIR/${DISTRO:-rke2}/certs/server/$(basename $CERT) 2>&1
+        done
+      fi
+  fi
+}
+
+function canonical-k8s-files() {
+  techo "Collecting Canonical k8s snap files"
+  CK8S_CURRENT_DIR="/var/snap/k8s/current"
+  CK8S_COMMON_DIR="/var/snap/k8s/common"
+
+  mkdir -p $TMPDIR/canonical-k8s
+
+  if [ -d "${CK8S_CURRENT_DIR}/args" ]; then
+    mkdir -p $TMPDIR/canonical-k8s/args
+    ls -lah "${CK8S_CURRENT_DIR}/args" > $TMPDIR/canonical-k8s/args/files 2>&1
+    cp -prf "${CK8S_CURRENT_DIR}/args"/* $TMPDIR/canonical-k8s/args 2>&1
+  fi
+
+  if [ -d "${CK8S_CURRENT_DIR}/certs" ]; then
+    mkdir -p $TMPDIR/canonical-k8s/certs
+    ls -lah "${CK8S_CURRENT_DIR}/certs" > $TMPDIR/canonical-k8s/certs/files 2>&1
+    cp -prf "${CK8S_CURRENT_DIR}/certs"/* $TMPDIR/canonical-k8s/certs 2>&1
+  fi
+
+  if [ -d "${CK8S_CURRENT_DIR}/credentials" ]; then
+    mkdir -p $TMPDIR/canonical-k8s/credentials
+    ls -lah "${CK8S_CURRENT_DIR}/credentials" > $TMPDIR/canonical-k8s/credentials/files 2>&1
+    cp -prf "${CK8S_CURRENT_DIR}/credentials"/* $TMPDIR/canonical-k8s/credentials 2>&1
+  fi
+
+  if [ -d "${CK8S_COMMON_DIR}/etc/containerd" ]; then
+    mkdir -p $TMPDIR/canonical-k8s/containerd
+    ls -lah "${CK8S_COMMON_DIR}/etc/containerd" > $TMPDIR/canonical-k8s/containerd/files 2>&1
+    cp -prf "${CK8S_COMMON_DIR}/etc/containerd"/* $TMPDIR/canonical-k8s/containerd 2>&1
+  fi
+}
+
+function canonical-k8s-dqlite() {
+  techo "Collecting Canonical k8s dqlite info"
+  DQLITE_DIR="/var/snap/k8s/common/var/lib/k8s-dqlite"
+  K8SD_DIR="/var/snap/k8s/common/var/lib/k8sd/state"
+
+  mkdir -p "$TMPDIR/dqlite"
+
+  # Collect dqlite cluster info and certificates
+  if [ -d "${DQLITE_DIR}" ]; then
+    ls -lah "${DQLITE_DIR}" > "$TMPDIR/dqlite/dqlite-files" 2>&1
+
+    # Copy dqlite certificates (parsed, not raw keys)
+    if [ -f "${DQLITE_DIR}/cluster.crt" ] && command -v openssl >/dev/null 2>&1; then
+      openssl x509 -in "${DQLITE_DIR}/cluster.crt" -text -noout > "$TMPDIR/dqlite/cluster-cert-info" 2>&1
+    fi
+  fi
+
+  # Collect k8sd state info
+  if [ -d "${K8SD_DIR}" ]; then
+    ls -lah "${K8SD_DIR}" > "$TMPDIR/dqlite/k8sd-state-files" 2>&1
+
+    # Copy k8sd certificates (parsed, not raw keys)
+    if [ -f "${K8SD_DIR}/cluster.crt" ] && command -v openssl >/dev/null 2>&1; then
+      openssl x509 -in "${K8SD_DIR}/cluster.crt" -text -noout > "$TMPDIR/dqlite/k8sd-cluster-cert-info" 2>&1
+    fi
+    if [ -f "${K8SD_DIR}/server.crt" ] && command -v openssl >/dev/null 2>&1; then
+      openssl x509 -in "${K8SD_DIR}/server.crt" -text -noout > "$TMPDIR/dqlite/k8sd-server-cert-info" 2>&1
+    fi
+  fi
+}
+
+function canonical-k8s-snap-info() {
+  if ! command -v snap >/dev/null 2>&1; then
+    skip "snap not present"
+    return 0
+  fi
+  mkdir -p "$TMPDIR/snap"
+  snap info k8s > "$TMPDIR/snap/k8s-info" 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# output — archive and cleanup
+# ---------------------------------------------------------------------------
+
+function archive() {
+  # Cluster name is unknown at setup() time, so the final bundle name is
+  # decided here: <cluster>-<hostname>-<timestamp>, degrading to
+  # <hostname>-<timestamp> when no cluster was reachable.
+  FINAL_LOGNAME="$LOGNAME"
+  if [ -n "$CLUSTER_NAME" ]; then
+    FINAL_LOGNAME="${CLUSTER_NAME}-${LOGNAME}"
+    FINAL_LOGNAME="${FINAL_LOGNAME//[^A-Za-z0-9._-]/_}"
+  fi
+
+  techo "Creating archive ${FINAL_LOGNAME}.tar.gz"
+
+  # Restore original fds to close the tee pipe and flush console.log. Only
+  # after this is it safe to rename $TMPDIR.
+  exec 1>&3 2>&4
+
+  if [ "$FINAL_LOGNAME" != "$LOGNAME" ]; then
+    if mv "$TMPDIR" "${TMPDIR_BASE}/${FINAL_LOGNAME}" 2>/dev/null; then
+      TMPDIR="${TMPDIR_BASE}/${FINAL_LOGNAME}"
+    else
+      FINAL_LOGNAME="$LOGNAME"
+    fi
+  fi
+
+  # Archive to -d <dir> if given, else CWD, else the temp base as last resort.
+  ARCHIVE_DIR="${OUTPUT_DIR:-$PWD}"
+  if [ ! -d "$ARCHIVE_DIR" ] || [ ! -w "$ARCHIVE_DIR" ]; then
+    techo "Archive directory $ARCHIVE_DIR is not writable, falling back to $TMPDIR_BASE"
+    ARCHIVE_DIR="$TMPDIR_BASE"
+  fi
+
+  TARBALL="${ARCHIVE_DIR}/${FINAL_LOGNAME}.tar.gz"
+  tar -czf "$TARBALL" -C "$TMPDIR_BASE" "$FINAL_LOGNAME" || {
+    techo "Failed to create tar file"
+    TARBALL=""
+    return
+  }
+
+  techo "Logs are archived in ${TARBALL}"
+  techo "Please upload the support bundle to the support ticket"
+}
+
+function cleanup() {
+  # Never delete the artifact we just produced: remove the whole temp base
+  # only when the tarball lives outside it.
+  if [ -n "$TARBALL" ] && [ -f "$TARBALL" ] && [ "$(dirname "$TARBALL")" != "$TMPDIR_BASE" ]; then
+    rm -rf "$TMPDIR_BASE" > /dev/null 2>&1
+  elif [ -n "$TMPDIR" ]; then
+    rm -rf "$TMPDIR" > /dev/null 2>&1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+function help() {
+  echo "SpectroCloud support bundle collector (consolidated)
+  Usage: support-bundle.sh [ flags ]
+
+  All flags are optional
+
+  # general flags
+  -d    Output directory for temporary storage and .tar.gz archive (ex: -d /var/tmp)
+  -K    Skip all Kubernetes collection (host-only bundle)
+  -H    Skip all host collection (cluster-only bundle; does not require root)
+  -q    Suppress per-resource progress output, keep the summary
+  -v    Print the support bundle version and exit
+
+  # host flags
+  -s    Start day of journald log collection. Specify the number of days before the current time (ex: -s 7)
+  -e    End day of journald log collection. Specify the number of days before the current time (ex: -e 5)
+  -S    Start date of journald log collection. (ex: -S 2024-01-01)
+  -E    End date of journald log collection. (ex: -E 2024-01-01)
+  -l    Number of log lines to collect from journald logs. (ex: -l 500000)
+  -j    Additional journald logs to collect. (ex: -j cloud-init,cloud-init-local)
+
+  # kubernetes flags
+  -k    Path to an explicit kubeconfig (ex: -k /etc/kubernetes/admin.conf)
+  -n    Additional namespaces to collect logs from. (ex: -n hello-universe,hello-world)
+  -r    Additional namespace scoped resources to collect. (ex: -r certificates.cert-manager.io,clusterissuers.cert-manager.io)
+  -R    Additional cluster scoped resources to collect. (ex: -R clusterissuers.cert-manager.io,clusterissuers.cert-manager.io)
+
+  "
+}
+
+while getopts "d:s:e:S:E:l:n:r:R:j:k:KHqvh" opt; do
+  case $opt in
+  d)
+    OUTPUT_DIR="${OPTARG}"
+    MKTEMP_BASEDIR="-p ${OPTARG}"
+    techo "Using custom output directory: ${OPTARG}"
+    ;;
+  s)
+    START_DAY=${OPTARG}
+    START=$(date -d "$START_DAY days ago" +%Y-%m-%d)
+    SINCE_FLAG="--since $START"
+    JOURNALD_FLAGS+=" ${SINCE_FLAG}"
+    techo "Logging since $START"
+    ;;
+  e)
+    END_DAY=${OPTARG}
+    END=$(date -d "$END_DAY days ago" +%Y-%m-%d)
+    UNTIL_FLAG="--until $END"
+    JOURNALD_FLAGS+=" ${UNTIL_FLAG}"
+    techo "Logging until $END"
+    ;;
+  S)
+    SINCE_FLAG="--since ${OPTARG}"
+    JOURNALD_FLAGS+=" ${SINCE_FLAG}"
+    techo "Collecting logs starting ${OPTARG}"
+    ;;
+  E)
+    UNTIL_FLAG="--until ${OPTARG}"
+    JOURNALD_FLAGS+=" ${UNTIL_FLAG}"
+    techo "Collecting logs until ${OPTARG}"
+    ;;
+  l)
+    NUM_LINES="${OPTARG}"
+    JOURNALD_FLAGS+=" -n ${NUM_LINES}"
+    CRICTL_FLAGS+=" --tail=${NUM_LINES}"
+    techo "Collecting most recent ${OPTARG} from journald and crictl logs"
+    ;;
+  n)
+    NAMESPACES=${OPTARG}
+    techo "Collecting logs for additional namespaces $NAMESPACES"
+    for NS in $(echo $NAMESPACES | tr "," "\n"); do
+      SYSTEM_NAMESPACES+=("$NS")
+    done
+    ;;
+  r)
+    RESOURCES=${OPTARG}
+    techo "Collecting logs for additional namespaced resources $RESOURCES"
+    for RESOURCE in $(echo $RESOURCES | tr "," "\n"); do
+      API_RESOURCES_NAMESPACED+=("$RESOURCE")
+    done
+    ;;
+  R)
+    RESOURCES=${OPTARG}
+    techo "Collecting logs for additional resources $RESOURCES"
+    for RESOURCE in $(echo $RESOURCES | tr "," "\n"); do
+      API_RESOURCES+=("$RESOURCE")
+    done
+    ;;
+  j)
+    RESOURCES=${OPTARG}
+    techo "Collecting additional journald logs $RESOURCES"
+    for RESOURCE in $(echo $RESOURCES | tr "," "\n"); do
+      JOURNALD_LOGS+=("$RESOURCE")
+    done
+    ;;
+  k)
+    KUBECONFIG_FLAG="${OPTARG}"
+    techo "Using kubeconfig from flag: ${OPTARG}"
+    ;;
+  K)
+    COLLECT_K8S=false
+    ;;
+  H)
+    COLLECT_HOST=false
+    ;;
+  q)
+    QUIET=true
+    ;;
+  v)
+    echo "$SB_VERSION"
+    exit 0
+    ;;
+  h)
+    help && exit 0
+    ;;
+  *)
+    help && exit 1
+    ;;
+  esac
+done
+
+if [ "$COLLECT_HOST" = false ] && [ "$COLLECT_K8S" = false ]; then
+  techo "Nothing to collect: -K and -H cannot be combined"
+  exit 1
+fi
+
+# Host collection requires root (matching support-bundle-edge.sh). A
+# cluster-only bundle (-H) matches support-bundle-infra.sh, which has never
+# required root.
+if [ "$COLLECT_HOST" = true ] && [ "$EUID" -ne 0 ] && [ -z "${DEV}" ]; then
+  help
+  techo "This script must be run as root. Use -H to collect a cluster-only bundle without root."
+  exit 1
+fi
+
+load-env
+defaults
+setup
+techo "Support Bundle Version: $SB_VERSION"
+
+# probe
+if [ "$COLLECT_HOST" = true ]; then
+  run_step "probe/distro" sherlock
+fi
+if [ "$COLLECT_K8S" = true ]; then
+  run_step "probe/kubeconfig" resolve-kubeconfig
+fi
+detect-capabilities
+
+# host tier
+if [ "$COLLECT_HOST" = true ]; then
+  run_step "host/system-info" system-info
+  run_step "host/chronyd-info" chronyd-info
+  run_step "host/networking-info" networking-info
+  run_step "host/var-log" var-log
+  run_step "host/journald-log" journald-log
+  run_step "host/storage-info" storage-info
+  # gpu-info needs kubectl reachable (to fall back to `kubectl exec` when
+  # rocm-smi/amd-smi aren't installed on the host — which is the norm on
+  # Kairos), so the kubeconfig probe has to run first.
+  run_step "host/gpu-info" gpu-info
+  run_step "host/stylus-files" stylus-files
+  run_step "runtime/crictl-logs" crictl-logs
+  run_step "runtime/helm-logs" helm-logs
+else
+  record-status SKIP "host" "host collection disabled (-H)"
+fi
+
+# k8s tier
+if [ "$COLLECT_K8S" = true ]; then
+  if [ "$HAS_CLUSTER" = true ]; then
+    run_step "k8s/defaults" spectro-k8s-defaults
+    run_step "k8s/rbac-coverage" validate-namespace-coverage
+    run_step "k8s/resources" k8s-resources
+    run_step "k8s/mongo-status" mongo-status
+  else
+    record-status SKIP "k8s" "no reachable Kubernetes API server"
+    techo "No reachable Kubernetes API server; skipping cluster collection"
+  fi
+else
+  record-status SKIP "k8s" "kubernetes collection disabled (-K)"
+fi
+
+# distro tier (host-level Kubernetes state)
+if [ "$COLLECT_HOST" = true ]; then
+  case "${DISTRO:-}" in
+  kubeadm)
+    run_step "distro/var-log-pods" var-log-pods
+    run_step "distro/opt-kubeadm-files" opt-kubeadm-files
+    run_step "distro/kubeadm-manifests" kubeadm-manifests
+    run_step "distro/kubeadm-certs" kubeadm-certs
+    run_step "distro/kubeadm-etcd" kubeadm-etcd
+    ;;
+  k3s)
+    run_step "distro/var-log-pods" var-log-pods
+    # TODO: k3s manifests, certs, etcd collection and logs
+    ;;
+  rke2)
+    run_step "distro/var-log-pods" var-log-pods
+    run_step "distro/rke2-certs" rke2-certs
+    # TODO: rke2 manifests, etcd collection and logs
+    ;;
+  canonical)
+    run_step "distro/canonical-k8s-files" canonical-k8s-files
+    run_step "distro/var-log-pods" var-log-pods
+    run_step "distro/kubeadm-certs" kubeadm-certs
+    run_step "distro/canonical-k8s-dqlite" canonical-k8s-dqlite
+    run_step "distro/canonical-k8s-snap-info" canonical-k8s-snap-info
+    ;;
+  *)
+    record-status SKIP "distro" "no k8s distribution detected on host"
+    ;;
+  esac
+fi
+
+print-summary
+archive
+cleanup
