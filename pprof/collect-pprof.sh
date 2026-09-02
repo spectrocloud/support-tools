@@ -74,9 +74,6 @@ DEPLOYS_DEFAULT="palette-controller-manager,cluster-management-agent"
 DEPLOYS="${DEPLOYS:-}"
 TARGETS_PALETTE=("manager:manager:8080::metrics:yes" "atop-manager:atop-manager:8082::metrics:yes")
 TARGETS_ALLY=("cma:cluster-management-agent:8082:palette-agent-debug-server-creds:debug/pprof/:no")
-# kube-rbac-proxy is a sidecar and must never be touched; `--all` would set
-# PROFILING on it pointlessly.
-CONTAINER_SELECTOR="${CONTAINER_SELECTOR:-*manager}"
 
 NS="${NS:-}"
 POD="${POD:-}"
@@ -147,7 +144,9 @@ Usage: collect-pprof.sh [options]
   -n NAMESPACE  Namespace. Default: auto-discovered from the deployment.
   -p POD        Pod name, overriding auto-discovery. Requires a single
                 deployment -- pair it with -d.
-  -s SECONDS    CPU/trace sample window. Default: 30.
+  -s SECONDS    CPU profile window. Default: 30. Execution-trace length is
+                controlled independently by TRACE_SECONDS (default 5); traces
+                grow large fast, so it is not on a flag.
   -S LIST       Comma-separated seconds at which to take each full sample set.
                 Overrides the automatic choice below. "0" = single sample.
   -c            CURRENT STATE ONLY: one sample, now, no restart, no waiting.
@@ -174,7 +173,7 @@ Usage: collect-pprof.sh [options]
 Environment overrides:
   DEPLOYS NS POD CPU_SECONDS TRACE_SECONDS OUT_DIR ENABLE_PROFILING KEEP_ENABLED
   FORCE_DISABLE PREPARE_ONLY SETTLE_SECONDS MIN_AGE_WARN RATE_GAP_SECONDS
-  TOP_SAMPLES TOP_GAP_SECONDS CONTAINER_SELECTOR SAMPLE_SCHEDULE CURRENT_ONLY
+  TOP_SAMPLES TOP_GAP_SECONDS SAMPLE_SCHEDULE CURRENT_ONLY
   SCHEDULE_RESTARTED SCHEDULE_ASFOUND
 
 Examples:
@@ -244,9 +243,10 @@ function targets_for() { # targets_for <deployment> -- print its target specs
 }
 
 function selector_for() { # selector_for <deployment> -- the -c selector for `kubectl set env`
+  # Hardcoded per deployment on purpose. There is no override knob: getting this
+  # wrong would set PROFILING on the kube-rbac-proxy sidecar (--all would too),
+  # which is pointless and confuses the rollout wait.
   case "$1" in
-    # kube-rbac-proxy is a sidecar and must never be touched; --all would set
-    # PROFILING on it pointlessly.
     palette-controller-manager) echo '*manager' ;;
     *) echo "$1" ;;
   esac

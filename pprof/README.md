@@ -93,7 +93,9 @@ By default the script **restores whatever state it found**. If it enabled profil
                 -d palette-controller-manager    # palette-controller-manager only
 -n NAMESPACE  Namespace. Default: auto-discovered.
 -p POD        Explicit pod name (single deployment only; pair with -d).
--s SECONDS    CPU / trace sample window. Default 30.
+-s SECONDS    CPU profile window in seconds. Default 30. The execution
+              trace length is set separately by the TRACE_SECONDS env
+              (default 5) and is not on a flag -- traces grow large fast.
 -S LIST       Explicit sample offsets in seconds, e.g. -S 0,600,1800.
               "0" = single sample.
 -c            CURRENT STATE ONLY: one sample, no restart, no waiting.
@@ -157,6 +159,54 @@ pprof-cluster-<uid>-<timestamp>/
 | `[<dep>] timed out after 120s waiting for a Ready pod carrying PROFILING=enable` | The rollout is stuck (image pull, admission webhook, resource pressure). | `kubectl -n <ns> rollout status deployment/<dep>` and `kubectl -n <ns> describe pod ...` to see why. |
 | `cma/debug/pprof/mutex http=404` in `FAILURES.txt` | Known limitation — `cluster-management-agent` doesn't currently expose the mutex profile. | Nothing you need to do; Support already knows. The rest of the bundle is unaffected. |
 | Bundle name reports "COLD START" | The youngest container has been running less than 2 minutes. | If you used `-P` first and waited, this shouldn't happen — check that the workload had time to re-establish. Otherwise re-run after leaving the pod alone for a few minutes. |
+
+---
+
+## For Palette Support engineers — customer-ready message
+
+> Paste verbatim into the ticket. Fill `<NAME>`. **Do not compress the two phases into one command** — that measures cold start instead of the real state.
+
+```text
+Hi <NAME>,
+
+To investigate, please run this Go profiling capture on the affected workload
+cluster and attach the resulting tarball to this ticket. It touches only
+palette-controller-manager and cluster-management-agent; nothing else is
+modified.
+
+Enabling profiling triggers a rolling restart of that one Deployment
+(typically under a minute). The script disables it again on exit, including
+on Ctrl-C or failure.
+
+Requirements: kubectl, curl, tar, bash 3.2+ (Linux or macOS).
+
+  # 1. Download
+  curl -sSLO https://raw.githubusercontent.com/spectrocloud/support-tools/main/pprof/collect-pprof.sh
+  chmod +x collect-pprof.sh
+
+  # 2. Point kubectl at the WORKLOAD cluster
+  export KUBECONFIG=/path/to/workload-cluster.kubeconfig
+  kubectl get nodes    # sanity check
+
+  # 3. Phase 1 -- enable profiling. Pod restarts now. Exits immediately.
+  ./collect-pprof.sh -P
+
+  # 4. Wait 10-15 minutes so the behaviour we're investigating re-appears.
+
+  # 5. Phase 2 -- collect. No further restart. ~5 minutes.
+  ./collect-pprof.sh
+
+Step 5 prints a path like:  pprof-cluster-<uid>-<timestamp>.tar.gz
+Please attach that single file to this ticket. The bundle contains
+manifests and controller logs; the ticket is private, but feel free to
+review and redact anything sensitive before uploading.
+
+If anything errors, paste the full console output into the ticket.
+
+Thanks,
+<YOUR NAME>
+Spectro Cloud Support
+```
 
 ---
 
