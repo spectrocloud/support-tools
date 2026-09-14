@@ -59,6 +59,42 @@ function techo() {
   echo "$(timestamp): $*"
 }
 
+# Set by check-api-server(); when the API server cannot be reached at all we
+# still collect everything that reads from disk instead of aborting.
+SKIP_K8S_COLLECTION=false
+API_UNREACHABLE_REASON=""
+
+# check-api-server distinguishes "the API server is unusable" from "this user is
+# denied by RBAC". Both make `kubectl auth can-i` answer "no", but they need very
+# different actions from the operator -- and an expired control-plane certificate
+# (the single most common cause here) is precisely when the host-side contents of
+# this bundle matter most.
+function check-api-server() {
+  local OUT
+  OUT="$(kubectl version -o json 2>&1 >/dev/null)"
+  if [[ -z "$OUT" ]]; then
+    return 0
+  fi
+
+  case "$OUT" in
+    *"certificate has expired"*|*"certificate is not yet valid"*)
+      API_UNREACHABLE_REASON="control-plane certificate expired or not yet valid" ;;
+    *x509*|*"tls: "*)
+      API_UNREACHABLE_REASON="TLS verification against the API server failed" ;;
+    *Unauthorized*|*"error: You must be logged in"*)
+      API_UNREACHABLE_REASON="credentials rejected by the API server (expired client certificate or bad kubeconfig)" ;;
+    *"connection refused"*|*"no route to host"*|*"i/o timeout"*|*"was refused"*)
+      API_UNREACHABLE_REASON="API server not reachable on the network" ;;
+    *"command not found"*)
+      API_UNREACHABLE_REASON="kubectl not found" ;;
+    *)
+      return 0 ;;
+  esac
+
+  API_UNREACHABLE_REASON="${API_UNREACHABLE_REASON}: ${OUT}"
+  return 1
+}
+
 function can-i-list() {
   local RESOURCE="$1"
   local NS="${2:-}"
@@ -92,7 +128,7 @@ Action: Check the ClusterRole or Role attached to the user or service account
             resources: [pods]
             verbs: [get, list]
 
-Exiting without creating an incomplete bundle.
+Archiving the host-level data collected so far, then exiting.
 EOF
 }
 
@@ -116,11 +152,28 @@ Action: Check the ClusterRole attached to the user or service account running
             resources: [customresourcedefinitions]
             verbs: [get, list]
 
-Exiting without creating an incomplete bundle.
+Archiving the host-level data collected so far, then exiting.
 EOF
 }
 
 function validate-namespace-coverage() {
+  if ! check-api-server; then
+    SKIP_K8S_COLLECTION=true
+    techo "[!] API server unusable: ${API_UNREACHABLE_REASON}"
+    techo "[!] Skipping cluster-resource collection; host-level data is still collected and archived."
+    {
+      echo "RBAC / Namespace Coverage Summary"
+      echo "Generated: $(timestamp)"
+      echo ""
+      echo "API server unusable - cluster-scoped and namespaced resource collection skipped."
+      echo "Reason: ${API_UNREACHABLE_REASON}"
+      echo ""
+      echo "This is NOT an RBAC problem. Everything collected from the host filesystem,"
+      echo "journald, crictl and the on-disk certificates is still present in this bundle."
+    } | tee "${TMPDIR}/namespace-coverage.txt"
+    return
+  fi
+
   local -a COLLECT_NAMESPACES=()
   local -a SKIPPED_NAMESPACES=()
   local -a RBAC_FAILURES=()
@@ -197,12 +250,14 @@ function validate-namespace-coverage() {
 
   if [[ ${#CLUSTER_RBAC_FAILURES[@]} -gt 0 ]]; then
     cluster-rbac-error-message "${CLUSTER_RBAC_FAILURES[*]}"
+    archive
     cleanup
     exit 1
   fi
 
   if [[ ${#RBAC_FAILURES[@]} -gt 0 ]]; then
     rbac-error-message "${RBAC_FAILURES[*]}"
+    archive
     cleanup
     exit 1
   fi
@@ -210,6 +265,7 @@ function validate-namespace-coverage() {
   if [[ ${#COLLECT_NAMESPACES[@]} -eq 0 ]]; then
     techo "ERROR: No namespaces available for collection after coverage validation."
     techo "Action: Verify cluster access and that at least one targeted namespace exists and is accessible."
+    archive
     cleanup
     exit 1
   fi
@@ -1405,6 +1461,32 @@ function kubeadm-certs() {
         do
           openssl x509 -in $CERT -text -noout > $TMPDIR/etc/kubernetes/pki/server/$(basename $CERT) 2>&1
       done
+
+      # The CAs are excluded above because they are not what expires day to day, but
+      # their validity window dates the cluster and tells a CA rotation apart from a
+      # leaf expiry -- so record them.
+      mkdir -p $TMPDIR/etc/kubernetes/pki/ca
+      CA_CERTS=$(find /etc/kubernetes/pki/ -maxdepth 2 -type f \( -name "ca.crt" -o -name "*-ca.crt" \))
+      for CERT in $CA_CERTS
+        do
+          openssl x509 -in $CERT -noout -subject -issuer -dates > $TMPDIR/etc/kubernetes/pki/ca/$(basename $CERT) 2>&1
+      done
+
+      # `kubeadm certs renew all` is normally run after taking a copy of the PKI. Those
+      # copies hold the *expired* certificates, which are the only record of what the
+      # validity window actually was before recovery -- collect their dates too.
+      for BAK in /etc/kubernetes/pki.bak* /etc/kubernetes/pki-backup*
+        do
+          [ -d "$BAK" ] || continue
+          techo "Collecting certificate dates from PKI backup $BAK"
+          BAK_DIR="$TMPDIR/etc/kubernetes/pki-backups/$(basename $BAK)"
+          mkdir -p "$BAK_DIR"
+          ls -lahR "$BAK" > "$BAK_DIR/files" 2>&1
+          for CERT in $(find "$BAK" -maxdepth 2 -type f -name "*.crt")
+            do
+              openssl x509 -in $CERT -noout -subject -issuer -dates > "$BAK_DIR/$(basename $CERT)" 2>&1
+          done
+      done
       if [ -d /var/lib/kubelet/pki/ ]; then
         techo "Collecting kubelet certificates"
         AGENT_CERTS=$(find /var/lib/kubelet/pki/ -maxdepth 2 -type f -name "*.crt" | grep -v "\-ca.crt$")
@@ -1508,6 +1590,14 @@ function rke2-certs() {
         for CERT in $SERVER_CERTS
           do
             openssl x509 -in $CERT -text -noout > $TMPDIR/${DISTRO}/certs/server/$(basename $CERT) 2>&1
+        done
+
+        # CA validity windows date the cluster and separate a CA rotation from a leaf expiry.
+        mkdir -p $TMPDIR/${DISTRO}/certs/ca
+        CA_CERTS=$(find ${RKE2_DATA_DIR}/server/tls -maxdepth 2 -type f -name "*-ca.crt")
+        for CERT in $CA_CERTS
+          do
+            openssl x509 -in $CERT -noout -subject -issuer -dates > $TMPDIR/${DISTRO}/certs/ca/$(basename $CERT) 2>&1
         done
       fi
   fi
@@ -1747,7 +1837,12 @@ stylus-files
 crictl-logs
 spectro-k8s-defaults
 validate-namespace-coverage
-k8s-resources
+# k8s-resources and mongo-status are the only collectors that need a working API
+# server; everything below reads the host filesystem, journald or etcdctl and is
+# most valuable precisely when the API server is down.
+if [ "${SKIP_K8S_COLLECTION}" != "true" ]; then
+  k8s-resources
+fi
 if [ "${DISTRO}" = "kubeadm" ]; then
   var-log-pods
   opt-kubeadm-files
@@ -1775,7 +1870,9 @@ if [ "${DISTRO}" = "canonical" ]; then
   canonical-k8s-snap-info
 fi
 
-mongo-status
+if [ "${SKIP_K8S_COLLECTION}" != "true" ]; then
+  mongo-status
+fi
 helm-logs
 archive
 cleanup
