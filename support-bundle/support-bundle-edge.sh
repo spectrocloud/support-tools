@@ -1162,6 +1162,19 @@ function spectro-k8s-defaults() {
     return 0
   fi
 
+  # An edge cluster keeps the SpectroCluster CR, the palette-edge-config ConfigMap,
+  # the cert-details secrets and the cluster-management-agent in a namespace whose
+  # name embeds the cluster UID (cluster-<uid>), and may use per-cluster variants of
+  # spectro-task/system-upgrade. None of those can be listed statically, so discover
+  # them instead of silently omitting the namespace that holds the cluster's own state.
+  for NS in $(kubectl get ns --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null \
+                | grep -E '^(cluster-|spectro-task-|system-upgrade-)'); do
+    if [[ ! " ${SYSTEM_NAMESPACES[*]} " =~ " ${NS} " ]]; then
+      techo "Discovered per-cluster namespace $NS"
+      SYSTEM_NAMESPACES+=("$NS")
+    fi
+  done
+
   for NS in "${SYSTEM_NAMESPACES[@]}"; do
     if ! kubectl get ns "$NS" >/dev/null 2>&1; then
       for i in "${!SYSTEM_NAMESPACES[@]}"; do
@@ -1618,6 +1631,48 @@ function helm-logs() {
   $STYLUS_ROOT/opt/spectrocloud/bin/helm plugin list > "$TMPDIR/helm/helm-plugin-list.log" 2>&1
 }
 
+# Palette's certificate renewal records its state in objects the generic collectors
+# deliberately skip: the per-node cert-details secrets (secrets are not collected
+# wholesale, and rightly so), the renewal threshold ConfigMap, the SpectroCluster
+# annotations that trigger a renewal, and the node labels crony writes when a
+# renewal task completes. Without these a bundle can show a healthy cluster and
+# say nothing about why an expiry was never acted on.
+#
+# The certificate-details payload is certificate names, issue dates and expiry
+# dates only (domain.CertificateDetails) - no key material - so it is decoded and
+# included. No other secret content is touched.
+function cert-renewal-state() {
+  techo "Collecting Palette certificate renewal state"
+  local OUT="${TMPDIR}/cert-renewal"
+  mkdir -p "$OUT"
+
+  kubectl get secret -A -l spectrocloud.com/cert-details \
+    -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,CREATED:.metadata.creationTimestamp,PROGRESS:.metadata.annotations.spectrocloud\.com/cert-renewal-progress' \
+    > "$OUT/cert-details-secrets" 2>&1
+
+  while read -r NS NAME; do
+    [ -z "$NS" ] && continue
+    kubectl get secret -n "$NS" "$NAME" -o jsonpath='{.data.certificate-details}' 2>/dev/null \
+      | base64 -d > "$OUT/${NAME}.yaml" 2>&1
+  done < <(kubectl get secret -A -l spectrocloud.com/cert-details \
+             -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' --no-headers 2>/dev/null)
+
+  # renewal threshold: palette-edge-config, key cert-renewal-day (default 30)
+  kubectl get cm -A --field-selector metadata.name=palette-edge-config -o yaml \
+    > "$OUT/palette-edge-config.yaml" 2>&1
+
+  # the annotations that trigger a renewal, and when they were last written
+  kubectl get spectroclusters.cluster.spectrocloud.com -A \
+    -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,MANUAL:.metadata.annotations.spectrocloud\.com/cert-renew-timestamp,AUTO:.metadata.annotations.spectrocloud\.com/auto-cert-renew-timestamp' \
+    > "$OUT/spectrocluster-cert-annotations" 2>&1
+
+  # crony stamps the task hash onto each node it has successfully run the task on;
+  # a node whose label lags the task's latestHash did not complete the renewal
+  kubectl get spectrosystemtasks.cluster.spectrocloud.com -A -o yaml > "$OUT/spectrosystemtasks.yaml" 2>&1
+  kubectl get nodes --show-labels > "$OUT/node-labels" 2>&1
+  kubectl get jobs -A -l controller=crony -o wide > "$OUT/crony-jobs" 2>&1
+}
+
 function crictl-logs() {
   if ! crictl --version >/dev/null 2>&1; then
     techo "crictl command not found"
@@ -1842,6 +1897,7 @@ validate-namespace-coverage
 # most valuable precisely when the API server is down.
 if [ "${SKIP_K8S_COLLECTION}" != "true" ]; then
   k8s-resources
+  cert-renewal-state
 fi
 if [ "${DISTRO}" = "kubeadm" ]; then
   var-log-pods
