@@ -1454,6 +1454,39 @@ function kubeadm-manifests() {
   kubeadm version -o yaml > $TMPDIR/etc/kubernetes/kubeadm-version.yaml 2>&1
 }
 
+# summarize-certs writes one line per certificate with its validity window and a
+# status, using nothing but openssl. On a cluster whose control-plane certificates
+# have expired the API server is unreachable and etcd is down with it, so this file
+# is often the only place a bundle can answer "what expired, and when" -- reading it
+# should not require opening 20 `openssl x509 -text` dumps.
+# $1 = directory to scan, $2 = output file
+function summarize-certs() {
+  local DIR="$1" OUT="$2" CERT STATUS NOTBEFORE NOTAFTER
+
+  [ -d "$DIR" ] || return
+  command -v openssl >/dev/null 2>&1 || return
+
+  {
+    printf '%-34s %-26s %-26s %s\n' "CERTIFICATE" "NOT BEFORE" "NOT AFTER" "STATUS"
+    printf '%-34s %-26s %-26s %s\n' "-----------" "----------" "---------" "------"
+    while read -r CERT; do
+      [ -n "$CERT" ] || continue
+      NOTBEFORE=$(openssl x509 -in "$CERT" -noout -startdate 2>/dev/null | cut -d= -f2)
+      NOTAFTER=$(openssl x509 -in "$CERT" -noout -enddate 2>/dev/null | cut -d= -f2)
+      if [ -z "$NOTAFTER" ]; then
+        STATUS="UNREADABLE"
+      elif ! openssl x509 -in "$CERT" -noout -checkend 0 >/dev/null 2>&1; then
+        STATUS="EXPIRED"
+      elif ! openssl x509 -in "$CERT" -noout -checkend 2592000 >/dev/null 2>&1; then
+        STATUS="EXPIRES <30d"
+      else
+        STATUS="ok"
+      fi
+      printf '%-34s %-26s %-26s %s\n' "${CERT#$DIR}" "$NOTBEFORE" "$NOTAFTER" "$STATUS"
+    done < <(find "$DIR" -maxdepth 2 -type f -name "*.crt" | sort)
+  } > "$OUT" 2>&1
+}
+
 function kubeadm-certs() {
 
   if ! command -v openssl >/dev/null 2>&1; then
@@ -1485,6 +1518,10 @@ function kubeadm-certs() {
           openssl x509 -in $CERT -noout -subject -issuer -dates > $TMPDIR/etc/kubernetes/pki/ca/$(basename $CERT) 2>&1
       done
 
+      summarize-certs /etc/kubernetes/pki "$TMPDIR/etc/kubernetes/pki/cert-expiry-summary"
+      [ -d /var/lib/kubelet/pki ] && \
+        summarize-certs /var/lib/kubelet/pki "$TMPDIR/etc/kubernetes/pki/kubelet-cert-expiry-summary"
+
       # `kubeadm certs renew all` is normally run after taking a copy of the PKI. Those
       # copies hold the *expired* certificates, which are the only record of what the
       # validity window actually was before recovery -- collect their dates too.
@@ -1499,6 +1536,7 @@ function kubeadm-certs() {
             do
               openssl x509 -in $CERT -noout -subject -issuer -dates > "$BAK_DIR/$(basename $CERT)" 2>&1
           done
+          summarize-certs "$BAK" "$BAK_DIR/cert-expiry-summary"
       done
       if [ -d /var/lib/kubelet/pki/ ]; then
         techo "Collecting kubelet certificates"
@@ -1604,6 +1642,8 @@ function rke2-certs() {
           do
             openssl x509 -in $CERT -text -noout > $TMPDIR/${DISTRO}/certs/server/$(basename $CERT) 2>&1
         done
+
+        summarize-certs ${RKE2_DATA_DIR}/server/tls "$TMPDIR/${DISTRO}/certs/cert-expiry-summary"
 
         # CA validity windows date the cluster and separate a CA rotation from a leaf expiry.
         mkdir -p $TMPDIR/${DISTRO}/certs/ca
