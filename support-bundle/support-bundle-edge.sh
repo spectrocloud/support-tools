@@ -59,6 +59,86 @@ function techo() {
   echo "$(timestamp): $*"
 }
 
+# Set by check-api-server(); when the API server cannot be reached at all we
+# still collect everything that reads from disk instead of aborting.
+SKIP_K8S_COLLECTION=false
+API_UNREACHABLE_REASON=""
+
+API_PROBE_TIMEOUT="${API_PROBE_TIMEOUT:-20}"
+
+# check-api-server distinguishes "the API server is unusable" from "this user is
+# denied by RBAC". Both make `kubectl auth can-i` answer "no", but they need very
+# different actions from the operator -- and an expired control-plane certificate
+# (the single most common cause here) is precisely when the host-side contents of
+# this bundle matter most.
+function check-api-server() {
+  local OUT RC BIN TIMEOUT_CMD=""
+  BIN="$KUBECTL_BIN"
+  [[ -n "$BIN" && -x "$BIN" ]] || BIN="$(type -P kubectl 2>/dev/null)"
+  if [[ -z "$BIN" ]]; then
+    API_UNREACHABLE_REASON="kubectl not found"
+    return 1
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="timeout ${API_PROBE_TIMEOUT}"
+  fi
+  OUT="$(${TIMEOUT_CMD} "$BIN" version -o json --request-timeout="${API_PROBE_TIMEOUT}s" 2>&1 >/dev/null)"
+  RC=$?
+  if [[ $RC -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ $RC -eq 124 ]]; then
+    API_UNREACHABLE_REASON="API server did not answer within ${API_PROBE_TIMEOUT}s"
+    [[ -n "$OUT" ]] && API_UNREACHABLE_REASON="${API_UNREACHABLE_REASON}: ${OUT}"
+    return 1
+  fi
+
+  case "$OUT" in
+    *"certificate has expired"*|*"certificate is not yet valid"*)
+      API_UNREACHABLE_REASON="control-plane certificate expired or not yet valid" ;;
+    *x509*|*"tls: "*)
+      API_UNREACHABLE_REASON="TLS verification against the API server failed" ;;
+    *Unauthorized*|*"error: You must be logged in"*)
+      API_UNREACHABLE_REASON="credentials rejected by the API server (expired client certificate or bad kubeconfig)" ;;
+    *"kubectl not found"*|*"command not found"*)
+      API_UNREACHABLE_REASON="kubectl not found" ;;
+    *"Config not found"*|*"error loading config"*|*"invalid configuration"*|*"no configuration has been provided"*)
+      API_UNREACHABLE_REASON="kubeconfig unusable (${KUBECONFIG:-unset})" ;;
+    *"connection refused"*|*"no route to host"*|*"no such host"*|*"i/o timeout"*|*"deadline exceeded"*|*"was refused"*|*"EOF"*)
+      API_UNREACHABLE_REASON="API server not reachable on the network" ;;
+    *)
+      API_UNREACHABLE_REASON="kubectl version exited ${RC}" ;;
+  esac
+
+  [[ -n "$OUT" ]] && API_UNREACHABLE_REASON="${API_UNREACHABLE_REASON}: ${OUT}"
+  return 1
+}
+
+function api-server-gate() {
+  if check-api-server; then
+    return 0
+  fi
+  SKIP_K8S_COLLECTION=true
+  techo "[!] API server unusable: ${API_UNREACHABLE_REASON}"
+  techo "[!] Skipping cluster-resource collection; host-level data is still collected and archived."
+  {
+    echo "RBAC / Namespace Coverage Summary"
+    echo "Generated: $(timestamp)"
+    echo ""
+    echo "API server unusable - cluster-scoped and namespaced resource collection skipped."
+    echo "Reason: ${API_UNREACHABLE_REASON}"
+    echo ""
+    echo "This is NOT an RBAC problem. Everything collected from the host filesystem,"
+    echo "journald, crictl and the on-disk certificates is still present in this bundle."
+  } | tee "${TMPDIR}/namespace-coverage.txt"
+  return 1
+}
+
+function api-server-usable() {
+  [[ "${SKIP_K8S_COLLECTION}" != "true" ]]
+}
+
 function can-i-list() {
   local RESOURCE="$1"
   local NS="${2:-}"
@@ -92,7 +172,7 @@ Action: Check the ClusterRole or Role attached to the user or service account
             resources: [pods]
             verbs: [get, list]
 
-Exiting without creating an incomplete bundle.
+Archiving the host-level data collected so far, then exiting.
 EOF
 }
 
@@ -116,11 +196,15 @@ Action: Check the ClusterRole attached to the user or service account running
             resources: [customresourcedefinitions]
             verbs: [get, list]
 
-Exiting without creating an incomplete bundle.
+Archiving the host-level data collected so far, then exiting.
 EOF
 }
 
 function validate-namespace-coverage() {
+  if ! api-server-usable; then
+    return
+  fi
+
   local -a COLLECT_NAMESPACES=()
   local -a SKIPPED_NAMESPACES=()
   local -a RBAC_FAILURES=()
@@ -197,12 +281,14 @@ function validate-namespace-coverage() {
 
   if [[ ${#CLUSTER_RBAC_FAILURES[@]} -gt 0 ]]; then
     cluster-rbac-error-message "${CLUSTER_RBAC_FAILURES[*]}"
+    archive
     cleanup
     exit 1
   fi
 
   if [[ ${#RBAC_FAILURES[@]} -gt 0 ]]; then
     rbac-error-message "${RBAC_FAILURES[*]}"
+    archive
     cleanup
     exit 1
   fi
@@ -210,6 +296,7 @@ function validate-namespace-coverage() {
   if [[ ${#COLLECT_NAMESPACES[@]} -eq 0 ]]; then
     techo "ERROR: No namespaces available for collection after coverage validation."
     techo "Action: Verify cluster access and that at least one targeted namespace exists and is accessible."
+    archive
     cleanup
     exit 1
   fi
@@ -691,7 +778,7 @@ function gpu-info() {
     fi
 
     # If neither is on the host, try inside any candidate pod.
-    if [ -z "$ROCM_SMI_BIN" ] && [ -z "$AMD_SMI_BIN" ] && kubectl version >/dev/null 2>&1; then
+    if [ -z "$ROCM_SMI_BIN" ] && [ -z "$AMD_SMI_BIN" ] && api-server-usable; then
       # rocm-smi / amd-smi live inside GPU-workload containers, not on Kairos
       # hosts. Try any pod in amd-gpu-operator, then any running vLLM/engine
       # pod in launchpad-ai. All kubectl exec calls are timeout-guarded.
@@ -753,7 +840,7 @@ function gpu-info() {
       timeout 10 nvidia-smi > "$TMPDIR/gpu/nvidia/nvidia-smi.txt" 2>&1 || true
       timeout 15 nvidia-smi topo -m > "$TMPDIR/gpu/nvidia/nvidia-smi-topo.txt" 2>&1 || true
       timeout 15 nvidia-smi --query-gpu=index,name,pci.bus_id,vbios_version,driver_version,pstate,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.used,ecc.errors.corrected.aggregate.total,ecc.errors.uncorrected.aggregate.total --format=csv > "$TMPDIR/gpu/nvidia/nvidia-smi-summary.csv" 2>&1 || true
-    elif kubectl version >/dev/null 2>&1; then
+    elif api-server-usable; then
       # Try NVIDIA GPU operator's driver/validator pod, then any running vLLM
       for NS in gpu-operator launchpad-ai; do
         for CAND in $(timeout 10 kubectl -n "$NS" get pods --field-selector=status.phase=Running -o name 2>/dev/null); do
@@ -782,7 +869,7 @@ function gpu-info() {
         NVIDIA_BUG_REPORT_CAPTURED=1
       fi
     fi
-    if [ "$NVIDIA_BUG_REPORT_CAPTURED" = "0" ] && kubectl version >/dev/null 2>&1; then
+    if [ "$NVIDIA_BUG_REPORT_CAPTURED" = "0" ] && api-server-usable; then
       # Fallback: exec inside any driver / validator / vLLM pod that ships
       # the tool. Stream the .gz back over stdout so we don't need kubectl cp
       # or an in-pod cleanup step.
@@ -1082,8 +1169,8 @@ function set-kubeconfig() {
 }
 
 function spectro-k8s-defaults() {
-  if ! kubectl version >/dev/null 2>&1; then
-    techo "kubectl command not found"
+  if ! api-server-usable; then
+    techo "API server unusable, skipping cluster namespace discovery"
     return
   fi
 
@@ -1105,6 +1192,19 @@ function spectro-k8s-defaults() {
 		SYSTEM_NAMESPACES=($(kubectl get ns --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null))
     return 0
   fi
+
+  # An edge cluster keeps the SpectroCluster CR, the palette-edge-config ConfigMap,
+  # the cert-details secrets and the cluster-management-agent in a namespace whose
+  # name embeds the cluster UID (cluster-<uid>), and may use per-cluster variants of
+  # spectro-task/system-upgrade. None of those can be listed statically, so discover
+  # them instead of silently omitting the namespace that holds the cluster's own state.
+  for NS in $(kubectl get ns --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null \
+                | grep -E '^(cluster-|spectro-task-|system-upgrade-)'); do
+    if [[ ! " ${SYSTEM_NAMESPACES[*]} " =~ " ${NS} " ]]; then
+      techo "Discovered per-cluster namespace $NS"
+      SYSTEM_NAMESPACES+=("$NS")
+    fi
+  done
 
   for NS in "${SYSTEM_NAMESPACES[@]}"; do
     if ! kubectl get ns "$NS" >/dev/null 2>&1; then
@@ -1350,8 +1450,12 @@ function k8s-resources() {
 function var-log-pods() {
   techo "Collecting k8s pod logs"
   mkdir -p "${TMPDIR}/k8s/pod-logs"
+  local NS DIR
   for NS in "${SYSTEM_NAMESPACES[@]}"; do
-    cp -prf /var/log/pods/"$NS"* "${TMPDIR}/k8s/pod-logs" 2>&1
+    for DIR in /var/log/pods/"${NS}"_*; do
+      [ -d "$DIR" ] || continue
+      cp -prf "$DIR" "${TMPDIR}/k8s/pod-logs" 2>&1
+    done
   done
 }
 
@@ -1385,6 +1489,151 @@ function kubeadm-manifests() {
   kubeadm version -o yaml > $TMPDIR/etc/kubernetes/kubeadm-version.yaml 2>&1
 }
 
+CERT_SUMMARY=""
+
+function cert-summary-init() {
+  CERT_SUMMARY="${TMPDIR}/cert-expiry-summary.txt"
+  local SYNC=""
+  if command -v timedatectl >/dev/null 2>&1; then
+    SYNC="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
+    [ -n "$SYNC" ] || SYNC="$(timedatectl status 2>/dev/null | grep -i 'synchronized' | sed 's/^ *//')"
+  fi
+  {
+    echo "Certificate Expiry Summary"
+    echo "Generated: $(timestamp)"
+    echo "Host time (UTC): $(date -u)"
+    echo "Clock synchronized (NTP): ${SYNC:-unknown}"
+    echo "Distribution: ${DISTRO:-unknown}"
+    if api-server-usable; then
+      echo "API server: usable"
+    else
+      echo "API server: unusable - ${API_UNREACHABLE_REASON}"
+    fi
+    echo ""
+    echo "Status is judged against the host clock above."
+    echo "Only public certificates are parsed; no private key material is read or copied."
+  } > "$CERT_SUMMARY"
+}
+
+function cert-summary-append() {
+  [ -n "$CERT_SUMMARY" ] && [ -s "$2" ] || return 0
+  { echo ""; echo "== $1"; cat "$2"; } >> "$CERT_SUMMARY"
+}
+
+function cert-summary-finish() {
+  [ -n "$CERT_SUMMARY" ] && [ -s "$CERT_SUMMARY" ] || return 0
+  techo "Certificate expiry summary written to cert-expiry-summary.txt"
+}
+
+function cert-table-header() {
+  printf '%-44s %-26s %-26s %s\n' "CERTIFICATE" "NOT BEFORE" "NOT AFTER" "STATUS"
+  printf '%-44s %-26s %-26s %s\n' "-----------" "----------" "---------" "------"
+}
+
+function cert-row() {
+  local LABEL="$1" CERT="$2" NOTBEFORE NOTAFTER STATUS
+  NOTBEFORE=$(openssl x509 -in "$CERT" -noout -startdate 2>/dev/null | cut -d= -f2)
+  NOTAFTER=$(openssl x509 -in "$CERT" -noout -enddate 2>/dev/null | cut -d= -f2)
+  if [ -z "$NOTAFTER" ]; then
+    STATUS="UNREADABLE"
+  elif ! openssl x509 -in "$CERT" -noout -checkend 0 >/dev/null 2>&1; then
+    STATUS="EXPIRED"
+  elif ! openssl x509 -in "$CERT" -noout -checkend 2592000 >/dev/null 2>&1; then
+    STATUS="EXPIRES <30d"
+  else
+    STATUS="ok"
+  fi
+  printf '%-44s %-26s %-26s %s\n' "$LABEL" "$NOTBEFORE" "$NOTAFTER" "$STATUS"
+}
+
+# summarize-certs writes one line per certificate with its validity window and a
+# status, using nothing but openssl. On a cluster whose control-plane certificates
+# have expired the API server is unreachable and etcd is down with it, so this file
+# is often the only place a bundle can answer "what expired, and when" -- reading it
+# should not require opening 20 `openssl x509 -text` dumps.
+# $1 = directory to scan, $2 = output file
+function summarize-certs() {
+  local DIR="$1" OUT="$2" CERT
+
+  [ -d "$DIR" ] || return
+  command -v openssl >/dev/null 2>&1 || return
+
+  {
+    cert-table-header
+    while read -r CERT; do
+      [ -n "$CERT" ] || continue
+      case "$CERT" in
+        *.pem) openssl x509 -in "$CERT" -noout >/dev/null 2>&1 || continue ;;
+      esac
+      cert-row "${CERT#$DIR/}" "$CERT"
+    done < <(find "$DIR" -maxdepth 2 \( -type f -o -type l \) \( -name "*.crt" -o -name "*.pem" \) | sort)
+  } > "$OUT" 2>&1
+  cert-summary-append "$DIR" "$OUT"
+}
+
+function kubeconfig-certs() {
+  local OUT="$1"; shift
+  local KC USER KIND VALUE TMPCERT
+  command -v openssl >/dev/null 2>&1 || return
+  TMPCERT="$(mktemp 2>/dev/null || echo "/tmp/.sb-kc-cert.$$")"
+
+  {
+    cert-table-header
+    for KC in "$@"; do
+      [ -n "$KC" ] || continue
+      if [ ! -f "$KC" ]; then
+        printf '%-44s %s\n' "$KC" "not found"
+        continue
+      fi
+      while IFS='|' read -r USER KIND VALUE; do
+        [ -n "$USER" ] || continue
+        case "$KIND" in
+          data)
+            if [ -n "$VALUE" ] && echo "$VALUE" | base64 -d > "$TMPCERT" 2>/dev/null; then
+              cert-row "$(basename "$KC"):$USER" "$TMPCERT"
+            else
+              printf '%-44s %s\n' "$(basename "$KC"):$USER" "client-certificate-data not decodable"
+            fi ;;
+          file)
+            if [ -f "$VALUE" ]; then
+              cert-row "$(basename "$KC"):$USER" "$VALUE"
+              printf '%-44s %s\n' "" "-> $VALUE"
+            else
+              printf '%-44s %s\n' "$(basename "$KC"):$USER" "client-certificate $VALUE not found"
+            fi ;;
+          *)
+            printf '%-44s %s\n' "$(basename "$KC"):$USER" "no client certificate (token or other auth)" ;;
+        esac
+      done < <(awk '
+        /^users:/ { inusers=1; next }
+        inusers && /^[^ -]/ { inusers=0 }
+        inusers && /^ *- name:/ { if (name != "") print name "|" kind "|" value; name=$3; kind="none"; value="" }
+        inusers && /client-certificate-data:/ { kind="data"; value=$2 }
+        inusers && /client-certificate:/ { kind="file"; value=$2 }
+        END { if (name != "") print name "|" kind "|" value }' "$KC")
+    done
+  } > "$OUT" 2>&1
+  rm -f "$TMPCERT"
+  cert-summary-append "kubeconfig client certificates (${OUT#$TMPDIR/})" "$OUT"
+}
+
+function existing-files() {
+  local F
+  for F in "$@"; do [ -f "$F" ] && echo "$F"; done
+}
+
+function host-certs() {
+  if ! command -v openssl >/dev/null 2>&1; then
+    techo "host-certs: openssl command not found, skipping certificate collection"
+    return
+  fi
+  cert-summary-init
+  kubeadm-certs
+  rancher-certs rke2 "${RKE2_DATA_DIR:-/var/lib/rancher/rke2}"
+  rancher-certs k3s "${K3S_DATA_DIR:-/var/lib/rancher/k3s}"
+  cert-summary-finish
+}
+
 function kubeadm-certs() {
 
   if ! command -v openssl >/dev/null 2>&1; then
@@ -1398,12 +1647,58 @@ function kubeadm-certs() {
       mkdir -p $TMPDIR/etc/kubernetes/pki/{server,kubelet}
 
       ls -lah /etc/kubernetes/ > $TMPDIR/etc/kubernetes/files 2>&1
+      ls -lahR --time-style=full-iso /etc/kubernetes/pki/ > $TMPDIR/etc/kubernetes/pki/files 2>&1
 
       techo "Collecting k8s kubeadm certificates"
       SERVER_CERTS=$(find /etc/kubernetes/pki/ -maxdepth 2 -type f -name "*.crt" | grep -v "\-ca.crt$")
       for CERT in $SERVER_CERTS
         do
           openssl x509 -in $CERT -text -noout > $TMPDIR/etc/kubernetes/pki/server/$(basename $CERT) 2>&1
+      done
+
+      # The CAs are excluded above because they are not what expires day to day, but
+      # their validity window dates the cluster and tells a CA rotation apart from a
+      # leaf expiry -- so record them.
+      mkdir -p $TMPDIR/etc/kubernetes/pki/ca
+      CA_CERTS=$(find /etc/kubernetes/pki/ -maxdepth 2 -type f \( -name "ca.crt" -o -name "*-ca.crt" \))
+      for CERT in $CA_CERTS
+        do
+          openssl x509 -in $CERT -noout -subject -issuer -dates > $TMPDIR/etc/kubernetes/pki/ca/$(basename $CERT) 2>&1
+      done
+
+      summarize-certs /etc/kubernetes/pki "$TMPDIR/etc/kubernetes/pki/cert-expiry-summary"
+      if [ -d /var/lib/kubelet/pki ]; then
+        ls -lah --time-style=full-iso /var/lib/kubelet/pki/ > $TMPDIR/etc/kubernetes/pki/kubelet/files 2>&1
+        summarize-certs /var/lib/kubelet/pki "$TMPDIR/etc/kubernetes/pki/kubelet-cert-expiry-summary"
+      fi
+
+      KUBECONFIGS=(/etc/kubernetes/admin.conf /etc/kubernetes/super-admin.conf /etc/kubernetes/controller-manager.conf
+                   /etc/kubernetes/scheduler.conf /etc/kubernetes/kubelet.conf /var/lib/kubelet/kubeconfig /run/kubeconfig)
+      if [ -n "$KUBECONFIG" ] && [[ ! " ${KUBECONFIGS[*]} " =~ " ${KUBECONFIG} " ]]; then
+        KUBECONFIGS+=("$KUBECONFIG")
+      fi
+      kubeconfig-certs "$TMPDIR/etc/kubernetes/kubeconfig-cert-expiry" "${KUBECONFIGS[@]}"
+
+      if command -v kubeadm >/dev/null 2>&1; then
+        timeout 30 kubeadm certs check-expiration > $TMPDIR/etc/kubernetes/kubeadm-certs-check-expiration 2>&1
+        cert-summary-append "kubeadm certs check-expiration" "$TMPDIR/etc/kubernetes/kubeadm-certs-check-expiration"
+      fi
+
+      # `kubeadm certs renew all` is normally run after taking a copy of the PKI. Those
+      # copies hold the *expired* certificates, which are the only record of what the
+      # validity window actually was before recovery -- collect their dates too.
+      for BAK in /etc/kubernetes/pki.bak* /etc/kubernetes/pki-backup*
+        do
+          [ -d "$BAK" ] || continue
+          techo "Collecting certificate dates from PKI backup $BAK"
+          BAK_DIR="$TMPDIR/etc/kubernetes/pki-backups/$(basename $BAK)"
+          mkdir -p "$BAK_DIR"
+          ls -lahR "$BAK" > "$BAK_DIR/files" 2>&1
+          for CERT in $(find "$BAK" -maxdepth 2 -type f -name "*.crt")
+            do
+              openssl x509 -in $CERT -noout -subject -issuer -dates > "$BAK_DIR/$(basename $CERT)" 2>&1
+          done
+          summarize-certs "$BAK" "$BAK_DIR/cert-expiry-summary"
       done
       if [ -d /var/lib/kubelet/pki/ ]; then
         techo "Collecting kubelet certificates"
@@ -1486,32 +1781,38 @@ function canonical-k8s-snap-info() {
   snap info k8s > "$TMPDIR/snap/k8s-info" 2>&1
 }
 
-function rke2-certs() {
+function rancher-certs() {
+  local NAME="$1" DIR="$2" CERT
+  [ -d "$DIR" ] || return
+  command -v openssl >/dev/null 2>&1 || return
 
-  if [ -d ${RKE2_DATA_DIR} ]
-    then
-      techo "Collecting rke2 directory state"
-      mkdir -p $TMPDIR/${DISTRO}/directories
-      ls -lah ${RKE2_DATA_DIR}/agent > $TMPDIR/${DISTRO}/directories/rke2agent 2>&1
-      ls -lahR ${RKE2_DATA_DIR}/server/manifests > $TMPDIR/${DISTRO}/directories/rke2servermanifests 2>&1
-      ls -lahR ${RKE2_DATA_DIR}/server/tls > $TMPDIR/${DISTRO}/directories/rke2servertls 2>&1
-      techo "Collecting rke2 certificates"
-      mkdir -p $TMPDIR/${DISTRO}/certs/{agent,server}
-      AGENT_CERTS=$(find ${RKE2_DATA_DIR}/agent -maxdepth 1 -type f -name "*.crt" | grep -v "\-ca.crt$")
-      for CERT in $AGENT_CERTS
-        do
-          openssl x509 -in $CERT -text -noout > $TMPDIR/${DISTRO}/certs/agent/$(basename $CERT) 2>&1
-      done
-      if [ -d ${RKE2_DATA_DIR}/server/tls ]; then
-        techo "Collecting rke2 server certificates"
-        SERVER_CERTS=$(find ${RKE2_DATA_DIR}/server/tls -maxdepth 1 -type f -name "*.crt" | grep -v "\-ca.crt$")
-        for CERT in $SERVER_CERTS
-          do
-            openssl x509 -in $CERT -text -noout > $TMPDIR/${DISTRO}/certs/server/$(basename $CERT) 2>&1
-        done
-      fi
+  techo "Collecting ${NAME} directory state"
+  mkdir -p $TMPDIR/${NAME}/directories $TMPDIR/${NAME}/certs/{agent,server,ca}
+  ls -lah ${DIR}/agent > $TMPDIR/${NAME}/directories/${NAME}agent 2>&1
+  ls -lahR ${DIR}/server/manifests > $TMPDIR/${NAME}/directories/${NAME}servermanifests 2>&1
+  ls -lahR --time-style=full-iso ${DIR}/server/tls > $TMPDIR/${NAME}/directories/${NAME}servertls 2>&1
+
+  techo "Collecting ${NAME} certificates"
+  for CERT in $(find ${DIR}/agent -maxdepth 1 -type f -name "*.crt" 2>/dev/null | grep -v "\-ca.crt$"); do
+    openssl x509 -in $CERT -text -noout > $TMPDIR/${NAME}/certs/agent/$(basename $CERT) 2>&1
+  done
+  summarize-certs ${DIR}/agent "$TMPDIR/${NAME}/certs/agent-cert-expiry-summary"
+
+  if [ -d ${DIR}/server/tls ]; then
+    techo "Collecting ${NAME} server certificates"
+    for CERT in $(find ${DIR}/server/tls -maxdepth 1 -type f -name "*.crt" | grep -v "\-ca.crt$"); do
+      openssl x509 -in $CERT -text -noout > $TMPDIR/${NAME}/certs/server/$(basename $CERT) 2>&1
+    done
+    summarize-certs ${DIR}/server/tls "$TMPDIR/${NAME}/certs/cert-expiry-summary"
+
+    # CA validity windows date the cluster and separate a CA rotation from a leaf expiry.
+    for CERT in $(find ${DIR}/server/tls -maxdepth 2 -type f -name "*-ca.crt"); do
+      openssl x509 -in $CERT -noout -subject -issuer -dates > $TMPDIR/${NAME}/certs/ca/$(basename $CERT) 2>&1
+    done
   fi
 
+  kubeconfig-certs "$TMPDIR/${NAME}/certs/kubeconfig-cert-expiry" \
+    $(existing-files ${DIR}/server/cred/*.kubeconfig ${DIR}/agent/*.kubeconfig /etc/rancher/${NAME}/${NAME}.yaml)
 }
 
 function helm-logs() {
@@ -1526,6 +1827,48 @@ function helm-logs() {
   $STYLUS_ROOT/opt/spectrocloud/bin/helm version > "$TMPDIR/helm/helm-version.log" 2>&1
   $STYLUS_ROOT/opt/spectrocloud/bin/helm env > "$TMPDIR/helm/helm-env.log" 2>&1
   $STYLUS_ROOT/opt/spectrocloud/bin/helm plugin list > "$TMPDIR/helm/helm-plugin-list.log" 2>&1
+}
+
+# Palette's certificate renewal records its state in objects the generic collectors
+# deliberately skip: the per-node cert-details secrets (secrets are not collected
+# wholesale, and rightly so), the renewal threshold ConfigMap, the SpectroCluster
+# annotations that trigger a renewal, and the node labels crony writes when a
+# renewal task completes. Without these a bundle can show a healthy cluster and
+# say nothing about why an expiry was never acted on.
+#
+# The certificate-details payload is certificate names, issue dates and expiry
+# dates only (domain.CertificateDetails) - no key material - so it is decoded and
+# included. No other secret content is touched.
+function cert-renewal-state() {
+  techo "Collecting Palette certificate renewal state"
+  local OUT="${TMPDIR}/cert-renewal"
+  mkdir -p "$OUT"
+
+  kubectl get secret -A -l spectrocloud.com/cert-details \
+    -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,CREATED:.metadata.creationTimestamp,PROGRESS:.metadata.annotations.spectrocloud\.com/cert-renewal-progress' \
+    > "$OUT/cert-details-secrets" 2>&1
+
+  while read -r NS NAME; do
+    [ -z "$NS" ] && continue
+    kubectl get secret -n "$NS" "$NAME" -o jsonpath='{.data.certificate-details}' 2>/dev/null \
+      | base64 -d > "$OUT/${NAME}.yaml" 2>&1
+  done < <(kubectl get secret -A -l spectrocloud.com/cert-details \
+             -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' --no-headers 2>/dev/null)
+
+  # renewal threshold: palette-edge-config, key cert-renewal-day (default 30)
+  kubectl get cm -A --field-selector metadata.name=palette-edge-config -o yaml \
+    > "$OUT/palette-edge-config.yaml" 2>&1
+
+  # the annotations that trigger a renewal, and when they were last written
+  kubectl get spectroclusters.cluster.spectrocloud.com -A \
+    -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,MANUAL:.metadata.annotations.spectrocloud\.com/cert-renew-timestamp,AUTO:.metadata.annotations.spectrocloud\.com/auto-cert-renew-timestamp' \
+    > "$OUT/spectrocluster-cert-annotations" 2>&1
+
+  # crony stamps the task hash onto each node it has successfully run the task on;
+  # a node whose label lags the task's latestHash did not complete the renewal
+  kubectl get spectrosystemtasks.cluster.spectrocloud.com -A -o yaml > "$OUT/spectrosystemtasks.yaml" 2>&1
+  kubectl get nodes --show-labels > "$OUT/node-labels" 2>&1
+  kubectl get jobs -A -l controller=crony -o wide > "$OUT/crony-jobs" 2>&1
 }
 
 function crictl-logs() {
@@ -1740,6 +2083,7 @@ storage-info
 # rocm-smi/amd-smi aren't installed on the host — which is the norm on
 # Kairos), so set-kubeconfig has to run first.
 set-kubeconfig
+api-server-gate
 gpu-info
 
 stylus-files
@@ -1747,12 +2091,19 @@ stylus-files
 crictl-logs
 spectro-k8s-defaults
 validate-namespace-coverage
-k8s-resources
+# k8s-resources and mongo-status are the only collectors that need a working API
+# server; everything below reads the host filesystem, journald or etcdctl and is
+# most valuable precisely when the API server is down.
+if [ "${SKIP_K8S_COLLECTION}" != "true" ]; then
+  k8s-resources
+  cert-renewal-state
+fi
+host-certs
+
 if [ "${DISTRO}" = "kubeadm" ]; then
   var-log-pods
   opt-kubeadm-files
   kubeadm-manifests
-  kubeadm-certs
   kubeadm-etcd
 fi
 
@@ -1762,20 +2113,17 @@ if [ "${DISTRO}" = "k3s" ]; then
 fi
 
 # TODO: rke2 info
-if [ "${DISTRO}" = "rke2" ]; then
-  rke2-certs
-  # TODO: rke2 manifests, certs, etcd collection and logs
-fi
 
 if [ "${DISTRO}" = "canonical" ]; then
   canonical-k8s-files
   var-log-pods
-  kubeadm-certs
   canonical-k8s-dqlite
   canonical-k8s-snap-info
 fi
 
-mongo-status
+if [ "${SKIP_K8S_COLLECTION}" != "true" ]; then
+  mongo-status
+fi
 helm-logs
 archive
 cleanup
