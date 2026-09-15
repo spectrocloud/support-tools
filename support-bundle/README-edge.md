@@ -60,6 +60,53 @@ All flags are optional:
 
 * `KUBECONFIG`: Path to the Kubernetes configuration file
   * Default: `/run/kubeconfig` if not specified
+* `API_PROBE_TIMEOUT`: Seconds allowed for the single API server reachability probe
+  * Default: `20`
+
+## Behaviour When the API Server Is Unusable
+
+Right after the kubeconfig is chosen, the script runs one bounded `kubectl version`
+probe. If the API server does not answer, rejects the connection (for example
+because the control-plane certificates have expired), or the kubeconfig is
+unusable, the script:
+
+* logs `[!] API server unusable: <reason>` and records the reason in
+  `namespace-coverage.txt` inside the bundle
+* skips every collector that needs `kubectl` (namespace discovery, cluster
+  resources, pod logs via the API, Palette certificate-renewal state, MongoDB)
+* still collects and archives everything that reads from the host: journald,
+  `/var/log`, `/oem` and stylus files, crictl output, static manifests, on-disk
+  certificate validity and etcd state
+
+No kubectl call is made after a failed probe, so an unreachable API server costs at
+most `API_PROBE_TIMEOUT` seconds instead of blocking the run.
+
+## Certificate Expiry Summary
+
+Every run, whether or not the API server is reachable, writes
+`cert-expiry-summary.txt` at the top of the bundle, built with `openssl` only so it
+is available when the cluster is down. It starts with the host
+UTC time and NTP sync state (every status is judged against that clock), then lists
+one row per certificate with its validity window and `EXPIRED`, `EXPIRES <30d` or
+`ok`:
+
+* kubeadm PKI under `/etc/kubernetes/pki` including etcd, and any `pki.bak*` /
+  `pki-backup*` copy left by a manual renewal
+* kubelet certificates under `/var/lib/kubelet/pki`, including the rotated
+  `kubelet-client-current.pem`
+* the client certificates embedded in or referenced by the component kubeconfigs
+  (`admin.conf`, `controller-manager.conf`, `scheduler.conf`, `kubelet.conf`,
+  `/run/kubeconfig`, `KUBECONFIG`)
+* k3s and RKE2 `server/tls`, `agent` and generated kubeconfig certificates
+* `kubeadm certs check-expiration` output where kubeadm is present
+
+Alongside the tables the bundle keeps full-precision file timestamps for the PKI
+directories, so the last successful renewal is visible, and the parsed
+`openssl x509 -text` output of each certificate.
+
+Only public certificates are parsed. Private keys (`*.key`, `client-key-data`, the
+key half of combined `.pem` files) are never read, decoded or copied, and no
+certificate is copied raw; the bundle contains parsed text only.
 
 ## Important Notes
 
