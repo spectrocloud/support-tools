@@ -19,6 +19,9 @@ SB_VERSION=20251117+16d5f3c
 # set -x
 
 SYSTEM_NAMESPACES=(amd-gpu-operator capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default gpu-operator grafana harbor headlamp keycloak konveyor-forklift kube-system kube-public kubernetes-dashboard kubevirt launchpad-ai longhorn-system metallb-system os-patch palette-system piraeus-system reach-system rook-ceph spectro-system spectro-task system-upgrade traefik victoria-metrics vm-dashboard zot-system)
+# On Enterprise and PCG clusters the script collects logs from every namespace,
+# but Helm release Secrets are only collected from the Spectro namespaces below.
+HELM_SECRET_NAMESPACES=("${SYSTEM_NAMESPACES[@]}" cp-system hubble-system jet-system spectro-mgmt ui-system)
 
 API_RESOURCES=(apiservices clusterroles clusterrolebindings crds csr mutatingwebhookconfigurations namespaces nodes priorityclasses pv storageclasses validatingwebhookconfigurations volumeattachments)
 
@@ -244,6 +247,10 @@ function k8s-resources() {
   techo "Collecting helm release secrets"
   mkdir -p "${TMPDIR}/k8s/cluster-resources/secrets"
   for NS in "${SYSTEM_NAMESPACES[@]}"; do
+    # On Enterprise/PCG clusters, skip namespaces that are not in HELM_SECRET_NAMESPACES
+    if [[ "$IS_ENTERPRISE_CLUSTER" == true || "$IS_PCG_CLUSTER" == true ]] && [[ ! " ${HELM_SECRET_NAMESPACES[*]} " =~ " ${NS} " ]]; then
+      continue
+    fi
     kubectl get secret -n "$NS" --field-selector type=helm.sh/release.v1 --show-managed-fields -o yaml > "${TMPDIR}/k8s/cluster-resources/secrets/${NS}.yaml" 2>&1
   done
 
