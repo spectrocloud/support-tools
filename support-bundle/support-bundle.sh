@@ -52,8 +52,12 @@ API_RESOURCES_NAMESPACED=(apiservices configmaps cronjobs daemonsets deployments
 
 VAR_LOG_LINES=500000
 
-# Collection scopes; -H disables host, -K disables kubernetes
-COLLECT_HOST=true
+# Collection scopes; -K disables kubernetes. Host scope defaults to "auto":
+# collected only when this machine is itself a cluster node (edge host or a
+# kubernetes node), so a run from a jump host or laptop collects the cluster
+# and nothing about the machine it ran on. -A forces host collection on, -H off.
+COLLECT_HOST=auto
+HOST_SCOPE_REASON=""
 COLLECT_K8S=true
 QUIET=false
 
@@ -125,6 +129,60 @@ function load-env() {
   export PATH=$PATH:$STYLUS_ROOT/usr/bin:$STYLUS_ROOT/usr/sbin:$STYLUS_ROOT/usr/local/bin
 }
 
+# detect-host-role — what this machine is, from filesystem and systemd markers
+# only (no root, no API server), so it can decide the host scope before the
+# root gate. Sets IS_EDGE_HOST, IS_K8S_NODE, IS_CAPI_NODE, HOST_ROLE and
+# HOST_ROLE_SIGNALS.
+#
+# Cluster API nodes (MAAS, vSphere, AWS, ... via the kubeadm bootstrap
+# provider) are told apart from edge hosts by CAPI's own bootstrap artifacts.
+# The /run markers are tmpfs and vanish on the first reboot, so the persistent
+# ones matter: the node.cluster.x-k8s.io/uninitialized taint CAPI registers
+# the kubelet with (kubeadm-flags.env), and the CAPI-rendered cloud-init
+# user-data. Edge hosts bootstrap through stylus + /opt/kubeadm instead and
+# carry none of these.
+function detect-host-role() {
+  local P U
+  HOST_ROLE_SIGNALS=()
+
+  IS_EDGE_HOST=false
+  for P in /oem /run/stylus /etc/spectro/environment "${STYLUS_ROOT}/opt/spectrocloud/state/agent-mode"; do
+    [ -e "$P" ] && { IS_EDGE_HOST=true; HOST_ROLE_SIGNALS+=("edge:$P"); }
+  done
+
+  IS_K8S_NODE=false
+  for P in /etc/kubernetes/kubelet.conf /var/lib/kubelet/config.yaml /var/lib/rancher/rke2/agent /var/lib/rancher/k3s/agent /var/snap/k8s/common/args/kubelet; do
+    [ -e "$P" ] && { IS_K8S_NODE=true; HOST_ROLE_SIGNALS+=("node:$P"); }
+  done
+  if command -v systemctl >/dev/null 2>&1; then
+    for U in kubelet k3s k3s-agent rke2-server rke2-agent snap.k8s.kubelet k8s.kubelet; do
+      systemctl is-active --quiet "$U" 2>/dev/null && { IS_K8S_NODE=true; HOST_ROLE_SIGNALS+=("unit:$U"); }
+    done
+  fi
+
+  IS_CAPI_NODE=false
+  if [ -e /run/cluster-api/bootstrap-success.complete ]; then
+    IS_CAPI_NODE=true; HOST_ROLE_SIGNALS+=("capi:/run/cluster-api/bootstrap-success.complete")
+  fi
+  if grep -qs 'node.cluster.x-k8s.io/uninitialized' /var/lib/kubelet/kubeadm-flags.env; then
+    IS_CAPI_NODE=true; HOST_ROLE_SIGNALS+=("capi:kubeadm-flags.env uninitialized taint")
+  fi
+  # user-data is root-only (0600); a non-root probe just misses this signal.
+  if grep -qs 'bootstrap-success.complete' /var/lib/cloud/instances/*/user-data.txt; then
+    IS_CAPI_NODE=true; HOST_ROLE_SIGNALS+=("capi:cloud-init user-data")
+  fi
+
+  if [ "$IS_EDGE_HOST" = true ]; then
+    HOST_ROLE=edge
+  elif [ "$IS_CAPI_NODE" = true ]; then
+    HOST_ROLE=capi-node
+  elif [ "$IS_K8S_NODE" = true ]; then
+    HOST_ROLE=k8s-node
+  else
+    HOST_ROLE=none
+  fi
+}
+
 function defaults() {
   CRICTL_FLAGS+=" --tail=${VAR_LOG_LINES}"
   techo "Using Crictl flags: ${CRICTL_FLAGS}"
@@ -162,7 +220,9 @@ function setup() {
   techo "Collecting logs in $TMPDIR"
   {
     echo "Support Bundle Version: $SB_VERSION"
-    echo "Host collection: $COLLECT_HOST"
+    echo "Host collection: $COLLECT_HOST ($HOST_SCOPE_REASON)"
+    echo "Host role: $HOST_ROLE"
+    echo "Host role signals: ${HOST_ROLE_SIGNALS[*]:-none}"
     echo "Kubernetes collection: $COLLECT_K8S"
   } > "$TMPDIR/.support-bundle"
 }
@@ -294,8 +354,13 @@ function resolve-kubeconfig() {
   for CANDIDATE in "${CANDIDATES[@]}"; do
     if [ -r "$CANDIDATE" ]; then
       export KUBECONFIG="$CANDIDATE"
-      techo "Using kubeconfig: $KUBECONFIG"
-      STEP_NOTE="$KUBECONFIG"
+      # A jump host's kubeconfig usually holds many contexts; say which cluster
+      # this bundle is about so a wrong current-context is caught at a glance.
+      local CTX SERVER
+      CTX=$(kubectl config current-context 2>/dev/null)
+      SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)
+      techo "Using kubeconfig: $KUBECONFIG (context: ${CTX:-unknown}, server: ${SERVER:-unknown})"
+      STEP_NOTE="$KUBECONFIG context=${CTX:-unknown} server=${SERVER:-unknown}"
       return 0
     fi
   done
@@ -317,10 +382,8 @@ function detect-capabilities() {
     HAS_CLUSTER=true
   fi
 
-  IS_EDGE_HOST=false
-  if [ -d /oem ] || [ -d /run/stylus ] || [ -f /etc/spectro/environment ]; then
-    IS_EDGE_HOST=true
-  fi
+  # IS_EDGE_HOST / IS_CAPI_NODE come from detect-host-role, which ran before
+  # the root gate.
 
   IS_AGENT_MODE=false
   [ -f "${STYLUS_ROOT}/opt/spectrocloud/state/agent-mode" ] && IS_AGENT_MODE=true
@@ -340,11 +403,14 @@ function detect-capabilities() {
     echo "HAS_CLUSTER=$HAS_CLUSTER"
     echo "IS_EDGE_HOST=$IS_EDGE_HOST"
     echo "IS_AGENT_MODE=$IS_AGENT_MODE"
+    echo "IS_K8S_NODE=$IS_K8S_NODE"
+    echo "IS_CAPI_NODE=$IS_CAPI_NODE"
+    echo "HOST_ROLE=$HOST_ROLE"
     echo "DISTRO=${DISTRO:-}"
     echo "HELM_BIN=${HELM_BIN:-}"
     echo "KUBECONFIG=${KUBECONFIG:-}"
   } >> "$TMPDIR/.support-bundle"
-  techo "Capabilities: root=$HAS_ROOT journald=$HAS_JOURNALD crictl=$HAS_CRICTL cluster=$HAS_CLUSTER edge-host=$IS_EDGE_HOST distro=${DISTRO:-none}"
+  techo "Capabilities: root=$HAS_ROOT journald=$HAS_JOURNALD crictl=$HAS_CRICTL cluster=$HAS_CLUSTER role=$HOST_ROLE distro=${DISTRO:-none}"
 }
 
 # crictl/kubectl shims: prefer distro-bundled binaries over PATH.
@@ -1082,6 +1148,95 @@ function stylus-files() {
 # runtime — container runtime and helm collectors
 # ---------------------------------------------------------------------------
 
+# resolve-node-name — this host's Node object name. Tries the hostname forms
+# first, then matches a local IP against each Node's InternalIP (cloud
+# providers often name nodes differently from the OS hostname).
+function resolve-node-name() {
+  local N IP ADDRS
+  NODE_NAME=""
+  for N in "$(hostname 2>/dev/null)" "$(hostname -s 2>/dev/null)" "$(hostname -f 2>/dev/null)"; do
+    [ -n "$N" ] || continue
+    N=$(echo "$N" | tr '[:upper:]' '[:lower:]')
+    if kubectl get node "$N" >/dev/null 2>&1; then
+      NODE_NAME="$N"
+      return 0
+    fi
+  done
+  # One "<name> <addr> <addr> ..." line per Node, matched against local IPs.
+  ADDRS=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.addresses[*]}{.address}{" "}{end}{"\n"}{end}' 2>/dev/null)
+  for IP in $(hostname -I 2>/dev/null); do
+    N=$(awk -v ip="$IP" '{for (i = 2; i <= NF; i++) if ($i == ip) {print $1; exit}}' <<< "$ADDRS")
+    if [ -n "$N" ]; then
+      NODE_NAME="$N"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# capi-node-from-api — fallback for nodes whose on-disk CAPI markers are gone
+# or were never written (no cloud-init, e.g. Ignition/Flatcar; non-kubeadm
+# bootstrap providers; a control plane whose /run sentinel was lost on reboot
+# and whose user-data was cleaned). The Machine controller annotates every
+# Node it owns with cluster.x-k8s.io/machine, so the API answers the question
+# the filesystem no longer can.
+function capi-node-from-api() {
+  local MACHINE
+  if [ "$HAS_CLUSTER" != true ]; then
+    skip "no reachable Kubernetes API server"
+    return 0
+  fi
+  if ! resolve-node-name; then
+    skip "this host is not a Node in the cluster the kubeconfig points at"
+    return 0
+  fi
+  MACHINE=$(kubectl get node "$NODE_NAME" -o jsonpath='{.metadata.annotations.cluster\.x-k8s\.io/machine}' 2>/dev/null)
+  if [ -z "$MACHINE" ]; then
+    STEP_NOTE="node ${NODE_NAME}: no cluster.x-k8s.io/machine annotation"
+    return 0
+  fi
+  HOST_ROLE_SIGNALS+=("capi:node annotation cluster.x-k8s.io/machine=${MACHINE}")
+  if [ "$IS_CAPI_NODE" != true ]; then
+    IS_CAPI_NODE=true
+    [ "$HOST_ROLE" = k8s-node ] && HOST_ROLE=capi-node
+    STEP_NOTE="node ${NODE_NAME} is machine ${MACHINE} (no on-disk markers; detected via API)"
+  else
+    STEP_NOTE="node ${NODE_NAME} is machine ${MACHINE}"
+  fi
+  {
+    echo "IS_CAPI_NODE=$IS_CAPI_NODE (after API check)"
+    echo "HOST_ROLE=$HOST_ROLE (after API check)"
+    echo "NODE_NAME=$NODE_NAME"
+  } >> "$TMPDIR/.support-bundle"
+}
+
+# capi-node-info — the Cluster API bootstrap state of this node. Records which
+# markers were found and the cloud-init outcome. The user-data itself carries
+# the kubeadm join token and, on control planes, the certificate key, so only
+# the CAPI markers it contains are recorded, never its content.
+function capi-node-info() {
+  local F
+  if [ "$IS_CAPI_NODE" != true ]; then
+    skip "no Cluster API bootstrap markers on this host"
+    return 0
+  fi
+  techo "Collecting Cluster API node bootstrap state"
+  mkdir -p "$TMPDIR/capi"
+  printf '%s\n' "${HOST_ROLE_SIGNALS[@]}" > "$TMPDIR/capi/node-signals.txt"
+  ls -la /run/cluster-api /run/kubeadm > "$TMPDIR/capi/run-markers.txt" 2>&1
+  [ -f /var/lib/kubelet/kubeadm-flags.env ] && cp -p /var/lib/kubelet/kubeadm-flags.env "$TMPDIR/capi/" 2>&1
+  if command -v cloud-init >/dev/null 2>&1; then
+    cloud-init status --long > "$TMPDIR/capi/cloud-init-status.txt" 2>&1
+  fi
+  ls -la /var/lib/cloud/instances/ > "$TMPDIR/capi/cloud-init-instances.txt" 2>&1
+  for F in /var/lib/cloud/instances/*/user-data.txt; do
+    [ -f "$F" ] || continue
+    echo "== $F"
+    grep -o 'bootstrap-success.complete\|/run/kubeadm/kubeadm[a-z-]*\.yaml\|kubeadm \(init\|join\) --config [^ &]*' "$F" | sort -u
+  done > "$TMPDIR/capi/user-data-markers.txt" 2>&1
+  STEP_NOTE="$(printf '%s\n' "${HOST_ROLE_SIGNALS[@]}" | grep '^capi:' | sed 's/^capi://' | paste -sd, -)"
+}
+
 function crictl-logs() {
   # Not `crictl --version`: newer crictl builds reject the flag, which made a
   # working crictl look absent. `crictl help` needs no runtime connection.
@@ -1574,6 +1729,52 @@ function mongo-status() {
     });'" > "${TMPDIR}/mongo/db-collection-sizes.txt" 2>&1
 }
 
+# capi-info — Cluster API state as seen from this cluster: object summaries
+# with conditions, and which Machine owns each Node. Palette pivots CAPI into
+# every workload cluster (objects in cluster-<uid>), so this is populated on
+# workload clusters as well as on management clusters and PCGs. Full object
+# YAML is already collected by k8s-resources' custom-resource sweep.
+function capi-info() {
+  local D="$TMPDIR/k8s/capi" KIND RESOURCES MACHINE
+  if ! kubectl get crd clusters.cluster.x-k8s.io >/dev/null 2>&1; then
+    skip "Cluster API CRDs not installed"
+    return 0
+  fi
+  techo "Collecting Cluster API summary"
+  mkdir -p "$D"
+
+  kubectl get nodes -o custom-columns='NODE:.metadata.name,CLUSTER:.metadata.annotations.cluster\.x-k8s\.io/cluster-name,NAMESPACE:.metadata.annotations.cluster\.x-k8s\.io/cluster-namespace,MACHINE:.metadata.annotations.cluster\.x-k8s\.io/machine,OWNER_KIND:.metadata.annotations.cluster\.x-k8s\.io/owner-kind,OWNER:.metadata.annotations.cluster\.x-k8s\.io/owner-name,PROVIDER_ID:.spec.providerID' \
+    > "$D/node-machine-map.txt" 2>&1
+
+  for KIND in clusters.cluster.x-k8s.io machinedeployments.cluster.x-k8s.io machinesets.cluster.x-k8s.io \
+    machines.cluster.x-k8s.io kubeadmcontrolplanes.controlplane.cluster.x-k8s.io \
+    machinehealthchecks.cluster.x-k8s.io machinepools.cluster.x-k8s.io; do
+    kubectl get crd "$KIND" >/dev/null 2>&1 || continue
+    {
+      echo "== $KIND"
+      kubectl get "$KIND" -A -o wide 2>&1
+      echo
+    } >> "$D/summary.txt"
+    kubectl get "$KIND" -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{.status.phase}{"\t"}{range .status.conditions[*]}{.type}={.status}{"("}{.reason}{") "}{end}{"\n"}{end}' \
+      > "$D/conditions-${KIND%%.*}.txt" 2>&1
+  done
+
+  RESOURCES=$(kubectl api-resources --api-group=infrastructure.cluster.x-k8s.io -o name 2>/dev/null)
+  for KIND in $RESOURCES; do
+    {
+      echo "== $KIND"
+      kubectl get "$KIND" -A -o wide 2>&1
+      echo
+    } >> "$D/infrastructure-summary.txt"
+  done
+
+  STEP_NOTE="$(kubectl get machines.cluster.x-k8s.io -A --no-headers 2>/dev/null | wc -l | xargs) machine(s)"
+  if [ "$COLLECT_HOST" = true ] && [ -n "$NODE_NAME" ]; then
+    MACHINE=$(kubectl get node "$NODE_NAME" -o jsonpath='{.metadata.annotations.cluster\.x-k8s\.io/machine}' 2>/dev/null)
+    [ -n "$MACHINE" ] && STEP_NOTE+="; this node ${NODE_NAME} is machine ${MACHINE}"
+  fi
+}
+
 function var-log-pods() {
   techo "Collecting k8s pod logs"
   mkdir -p "${TMPDIR}/k8s/pod-logs"
@@ -1853,6 +2054,11 @@ function help() {
   -d    Output directory for temporary storage and .tar.gz archive (ex: -d /var/tmp)
   -K    Skip all Kubernetes collection (host-only bundle)
   -H    Skip all host collection (cluster-only bundle; does not require root)
+  -A    Collect host data even when this machine is not detected as a cluster node
+
+  Host collection is automatic: it runs only when this machine is an edge host
+  or a Kubernetes node (Cluster API nodes included). From a jump host or laptop
+  the bundle is cluster-only and root is not required.
   -q    Suppress per-resource progress output, keep the summary
   -v    Print the support bundle version and exit
 
@@ -1873,7 +2079,7 @@ function help() {
   "
 }
 
-while getopts "d:s:e:S:E:l:n:r:R:j:k:KHqvh" opt; do
+while getopts "d:s:e:S:E:l:n:r:R:j:k:KHAqvh" opt; do
   case $opt in
   d)
     OUTPUT_DIR="${OPTARG}"
@@ -1947,6 +2153,11 @@ while getopts "d:s:e:S:E:l:n:r:R:j:k:KHqvh" opt; do
     ;;
   H)
     COLLECT_HOST=false
+    HOST_SCOPE_REASON="disabled by -H"
+    ;;
+  A)
+    COLLECT_HOST=true
+    HOST_SCOPE_REASON="forced by -A"
     ;;
   q)
     QUIET=true
@@ -1964,8 +2175,20 @@ while getopts "d:s:e:S:E:l:n:r:R:j:k:KHqvh" opt; do
   esac
 done
 
+detect-host-role
+if [ "$COLLECT_HOST" = auto ]; then
+  if [ "$HOST_ROLE" != none ]; then
+    COLLECT_HOST=true
+    HOST_SCOPE_REASON="auto: ${HOST_ROLE}"
+  else
+    COLLECT_HOST=false
+    HOST_SCOPE_REASON="auto: not an edge host or cluster node; -A to force"
+  fi
+fi
+techo "Host role: ${HOST_ROLE} (${HOST_ROLE_SIGNALS[*]:-no markers}); host collection: ${COLLECT_HOST} (${HOST_SCOPE_REASON})"
+
 if [ "$COLLECT_HOST" = false ] && [ "$COLLECT_K8S" = false ]; then
-  techo "Nothing to collect: -K and -H cannot be combined"
+  techo "Nothing to collect: host collection is off (${HOST_SCOPE_REASON}) and -K disables Kubernetes"
   exit 1
 fi
 
@@ -1974,7 +2197,7 @@ fi
 # required root.
 if [ "$COLLECT_HOST" = true ] && [ "$EUID" -ne 0 ] && [ -z "${DEV}" ]; then
   help
-  techo "This script must be run as root. Use -H to collect a cluster-only bundle without root."
+  techo "This script must be run as root on a cluster node (${HOST_SCOPE_REASON}). Use -H to collect a cluster-only bundle without root."
   exit 1
 fi
 
@@ -1991,6 +2214,9 @@ if [ "$COLLECT_K8S" = true ]; then
   run_step "probe/kubeconfig" resolve-kubeconfig
 fi
 detect-capabilities
+if [ "$COLLECT_HOST" = true ] && [ "$COLLECT_K8S" = true ]; then
+  run_step "probe/capi-node-api" capi-node-from-api
+fi
 
 # host tier
 if [ "$COLLECT_HOST" = true ]; then
@@ -2005,10 +2231,11 @@ if [ "$COLLECT_HOST" = true ]; then
   # Kairos), so the kubeconfig probe has to run first.
   run_step "host/gpu-info" gpu-info
   run_step "host/stylus-files" stylus-files
+  run_step "host/capi-node-info" capi-node-info
   run_step "runtime/crictl-logs" crictl-logs
   run_step "runtime/helm-logs" helm-logs
 else
-  record-status SKIP "host" "host collection disabled (-H)"
+  record-status SKIP "host" "host collection off (${HOST_SCOPE_REASON})"
 fi
 
 # k8s tier
@@ -2017,6 +2244,7 @@ if [ "$COLLECT_K8S" = true ]; then
     run_step "k8s/defaults" spectro-k8s-defaults
     run_step "k8s/rbac-coverage" validate-namespace-coverage
     run_step "k8s/resources" k8s-resources
+    run_step "k8s/capi" capi-info
     run_step "k8s/mongo-status" mongo-status
   else
     record-status SKIP "k8s" "no reachable Kubernetes API server"
