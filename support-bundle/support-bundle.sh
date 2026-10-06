@@ -1083,7 +1083,9 @@ function stylus-files() {
 # ---------------------------------------------------------------------------
 
 function crictl-logs() {
-  if ! crictl --version >/dev/null 2>&1; then
+  # Not `crictl --version`: newer crictl builds reject the flag, which made a
+  # working crictl look absent. `crictl help` needs no runtime connection.
+  if ! crictl help >/dev/null 2>&1; then
     skip "crictl not present"
     return 0
   fi
