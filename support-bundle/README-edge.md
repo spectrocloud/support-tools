@@ -293,6 +293,24 @@ All `launchpad.spectrocloud.com/v1alpha1` CRs are collected via the generic CRD 
 #### Kernel evidence (previous boot)
 * `dmesg-previous-boot` and `journalctl-previous-boot` — full kernel log from the boot BEFORE this one. Present only when journald has persistent storage (`/var/log/journal/` populated). Critical for post-crash forensics: if a GPU wedge caused the host to lose networking and reboot, the surviving evidence is here.
 
+### kdump Collection
+
+On hosts where kdump-tools is installed, the `kdump-info` step writes `kdump/`:
+
+* `listing`: `/usr/local/kdump` and each capture directory (names, sizes, times)
+* `captures/<stamp>/dmesg.<stamp>`: the kernel log of each crashed kernel. This is kernel log text only, but it includes anything written to the kernel log before the crash
+* `kdump-config-status`, `kexec_crash_size`, `kexec_crash_loaded`: whether crash memory is reserved and the capture kernel is loaded
+* `crashkernel`: the `crashkernel=` value on the kernel command line
+* `kdump-tools.default`, `kdump-tools.override`, `kdump-tools`: image defaults, operator overrides and the generated configuration
+* `journal-kdump-tools`: journal of `kdump-tools` and `kdump-tools-dump`
+* `pstore-current-boot`, `pstore-previous-boot`: the text of the pstore records archived in the current and previous boot (the journal `FILE` field, which the short-format `journald/journalctl` omits)
+
+A `dmesg.*` larger than 32 MiB is not copied, and is reported only in `kdump/listing`. `pstore-current-boot` and `pstore-previous-boot` cover the two most recent boots only: records archived earlier stay in the journal (list them on the host with `journalctl -a -t systemd-pstore -o cat --output-fields=FILE`), so an empty file is not proof the host never panicked.
+
+Dump files (`dump.<stamp>`, `dump-incomplete`, `vmcore-incomplete`, `vmcore.<stamp>`) are never collected: they are large and contain kernel memory. To retrieve a dump, follow the retrieval procedure in the kdump operator guide.
+
+The step is skipped on hosts without kdump-tools and never fails the bundle.
+
 ### MongoDB Collection (Enterprise Clusters Only)
 
 For Enterprise and PCG clusters, the script collects MongoDB replica set information:

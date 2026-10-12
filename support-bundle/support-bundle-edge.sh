@@ -626,6 +626,83 @@ function storage-info() {
   fi
 }
 
+# kdump (PE-9067): state, configuration, the kernel log of each capture and
+# the pstore record text. Runs only where kdump-tools is installed. Copies
+# dmesg.* only: dumps (dump.*, dump-incomplete, vmcore-incomplete) are never
+# collected.
+function kdump-info() {
+  local KDUMP_DIR=/usr/local/kdump DMESG_MAX=33554432
+  local KDUMP_CONFIG OUT D F SIZE
+
+  KDUMP_CONFIG="$(command -v kdump-config 2>/dev/null || true)"
+  if [ -z "$KDUMP_CONFIG" ] && [ -x /usr/sbin/kdump-config ]; then
+    KDUMP_CONFIG=/usr/sbin/kdump-config
+  fi
+  if [ -z "$KDUMP_CONFIG" ]; then
+    return 0
+  fi
+
+  techo "Collecting kdump state"
+  OUT="$TMPDIR/kdump"
+  mkdir -p "$OUT"
+
+  if [ -d "$KDUMP_DIR" ]; then
+    {
+      ls -la "$KDUMP_DIR" || true
+      for D in "$KDUMP_DIR"/*; do
+        if [ -L "$D" ] || [ ! -d "$D" ]; then
+          continue
+        fi
+        echo
+        ls -la "$D" || true
+      done
+    } > "$OUT/listing" 2>&1
+
+    for F in "$KDUMP_DIR"/*/dmesg.*; do
+      if [ ! -f "$F" ] || [ -L "$F" ] || [ -L "$(dirname "$F")" ]; then
+        continue
+      fi
+      SIZE="$(stat -c %s "$F" 2>/dev/null || true)"
+      if [ -z "$SIZE" ]; then
+        echo "size unknown for $F: copied without the size check" >> "$OUT/listing"
+      elif [ "$SIZE" -gt "$DMESG_MAX" ]; then
+        echo "skipped $F: $SIZE bytes" >> "$OUT/listing"
+        continue
+      fi
+      D="$OUT/captures/$(basename "$(dirname "$F")")"
+      mkdir -p "$D" && { cp -p "$F" "$D/" 2>&1 || true; }
+    done
+  fi
+
+  timeout 30 "$KDUMP_CONFIG" status > "$OUT/kdump-config-status" 2>&1 || true
+
+  for F in kexec_crash_size kexec_crash_loaded; do
+    if [ -e "/sys/kernel/$F" ]; then
+      cat "/sys/kernel/$F" > "$OUT/$F" 2>&1 || true
+    fi
+  done
+
+  if ! grep -o 'crashkernel=[^ ]*' /proc/cmdline > "$OUT/crashkernel" 2>/dev/null; then
+    echo "no crashkernel= on the kernel command line" > "$OUT/crashkernel"
+  fi
+
+  for F in /etc/default/kdump-tools.default /etc/default/kdump-tools.override /etc/default/kdump-tools; do
+    if [ -f "$F" ]; then
+      cp -p "$F" "$OUT/" 2>&1 || true
+    fi
+  done
+
+  # shellcheck disable=SC2086 # JOURNALD_FLAGS is a flag list, split on purpose
+  journalctl --no-pager -u kdump-tools -u kdump-tools-dump $JOURNALD_FLAGS > "$OUT/journal-kdump-tools" 2>&1 || true
+
+  # pstore record text (FILE=); the short-format journald/journalctl shows only
+  # "PStore dmesg-..." names.
+  journalctl --no-pager -a -t systemd-pstore -b 0 -o cat --output-fields=FILE > "$OUT/pstore-current-boot" 2>&1 || true
+  if [ "$(journalctl --no-pager --list-boots 2>/dev/null | grep -c -E '[0-9a-f]{32}')" -ge 2 ]; then
+    journalctl --no-pager -a -t systemd-pstore -b -1 -o cat --output-fields=FILE > "$OUT/pstore-previous-boot" 2>&1 || true
+  fi
+}
+
 function gpu-info() {
   # Collect GPU host state for AI/inference appliances (launchpad-ai and other
   # GPU-bearing edge nodes). Emits an empty gpu/ directory on nodes with no
@@ -2079,6 +2156,7 @@ networking-info
 var-log
 journald-log
 storage-info
+kdump-info
 # gpu-info needs kubectl reachable (to fall back to `kubectl exec` when
 # rocm-smi/amd-smi aren't installed on the host — which is the norm on
 # Kairos), so set-kubeconfig has to run first.
