@@ -303,13 +303,24 @@ On hosts where kdump-tools is installed, the `kdump-info` step writes `kdump/`:
 * `crashkernel`: the `crashkernel=` value on the kernel command line
 * `kdump-tools.default`, `kdump-tools.override`, `kdump-tools`: image defaults, operator overrides and the generated configuration
 * `journal-kdump-tools`: journal of `kdump-tools` and `kdump-tools-dump`
-* `pstore-current-boot`, `pstore-previous-boot`: the text of the pstore records archived in the current and previous boot (the journal `FILE` field, which the short-format `journald/journalctl` omits)
 
-A `dmesg.*` larger than 32 MiB is not copied, and is reported only in `kdump/listing`. `pstore-current-boot` and `pstore-previous-boot` cover the two most recent boots only: records archived earlier stay in the journal (list them on the host with `journalctl -a -t systemd-pstore -o cat --output-fields=FILE`), so an empty file is not proof the host never panicked.
+A `dmesg.*` larger than 32 MiB is not copied, and is reported only in `kdump/listing`.
 
 Dump files (`dump.<stamp>`, `dump-incomplete`, `vmcore-incomplete`, `vmcore.<stamp>`) are never collected: they are large and contain kernel memory. To retrieve a dump, follow the retrieval procedure in the kdump operator guide.
 
-The step is skipped on hosts without kdump-tools and never fails the bundle.
+The step is skipped on hosts without kdump-tools and never fails the bundle. The pstore records are collected by a separate step, below.
+
+### pstore Collection
+
+The `pstore-info` step writes `pstore/records` on every host whose journal holds `systemd-pstore` records, with or without kdump-tools. At the next boot after a panic, `systemd-pstore` writes each record to the journal unless `Storage=none` is set (checked on systemd 255, as on Ubuntu 24.04). The text therefore reaches the bundle on hosts with the default `Storage=external` as well as on hosts with `Storage=journal`, for example the FIPS, STIG and CIS Ubuntu 24.04 images built with the CanvOS pstore setting. On hosts without records the step writes nothing.
+
+* The file holds the journal `FILE` field of each record, which the short-format `journald/journalctl` omits (it shows only `PStore dmesg-...` names). It is exported with `journalctl -a -t systemd-pstore _UID=0 -o verbose --output-fields=FILE`; only entries written by root are taken, because any local process can log under that identifier. Every record starts with a header that carries the archive time and, in the `b=` part of the bracketed cursor, the id of the boot that archived the record (the boot after the panic, with the default `Unlink=yes`), followed by the kernel log text under a `Panic#N PartK` header. One panic is about 15 records and 30 KB. Match on a substring such as `Kernel panic - not syncing`: continuation lines are indented, so an anchored pattern does not match.
+* It covers every boot the journal retains. The `-s`, `-e`, `-S`, `-E` and `-l` flags and the default line limit do not trim it. Output above 16 MiB (about 500 panics) keeps the newest records, the oldest record can be cut, and the console line says so.
+* This is kernel log text only, but it includes anything written to the kernel log before the crash.
+* If `journalctl` writes to stderr and no record is collected, the console line names the first stderr line. Warnings that come with records are kept in `pstore/journalctl.err`.
+* Not covered: hosts where `systemd-pstore` does not archive to the journal (`Storage=none` leaves the records in `/sys/fs/pstore`, or the service is disabled), and records the journal has already deleted. On a host with a volatile journal the records stay in the bundle only until the next reboot. The step does not read `/sys/fs/pstore` or `/var/lib/systemd/pstore`.
+
+The step never fails the bundle.
 
 ### MongoDB Collection (Enterprise Clusters Only)
 

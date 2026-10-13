@@ -626,10 +626,10 @@ function storage-info() {
   fi
 }
 
-# kdump (PE-9067): state, configuration, the kernel log of each capture and
-# the pstore record text. Runs only where kdump-tools is installed. Copies
-# dmesg.* only: dumps (dump.*, dump-incomplete, vmcore-incomplete) are never
-# collected.
+# kdump (PE-9067): state, configuration and the kernel log of each capture.
+# Runs only where kdump-tools is installed. Copies dmesg.* only: dumps
+# (dump.*, dump-incomplete, vmcore-incomplete) are never collected. The pstore
+# records are collected separately, by pstore-info.
 function kdump-info() {
   local KDUMP_DIR=/usr/local/kdump DMESG_MAX=33554432
   local KDUMP_CONFIG OUT D F SIZE
@@ -694,13 +694,42 @@ function kdump-info() {
 
   # shellcheck disable=SC2086 # JOURNALD_FLAGS is a flag list, split on purpose
   journalctl --no-pager -u kdump-tools -u kdump-tools-dump $JOURNALD_FLAGS > "$OUT/journal-kdump-tools" 2>&1 || true
+}
 
-  # pstore record text (FILE=); the short-format journald/journalctl shows only
-  # "PStore dmesg-..." names.
-  journalctl --no-pager -a -t systemd-pstore -b 0 -o cat --output-fields=FILE > "$OUT/pstore-current-boot" 2>&1 || true
-  if [ "$(journalctl --no-pager --list-boots 2>/dev/null | grep -c -E '[0-9a-f]{32}')" -ge 2 ]; then
-    journalctl --no-pager -a -t systemd-pstore -b -1 -o cat --output-fields=FILE > "$OUT/pstore-previous-boot" 2>&1 || true
+# pstore records (PE-9067): the kernel log of each panic, as logged by
+# systemd-pstore into the journal at the next boot (every Storage= setting but
+# none). Independent of kdump-tools: runs wherever the journal holds records
+# and creates nothing otherwise. The short-format journald/journalctl shows only
+# the "PStore dmesg-..." names; the text is in the FILE field, so it is exported
+# here in verbose format (archive time and boot id per record). Only entries
+# written by root are taken (_UID=0): any local process can log under the
+# systemd-pstore identifier. JOURNALD_FLAGS is ignored on purpose: these records
+# are the evidence an operator who trims the journal needs most. The newest
+# PSTORE_MAX_BYTES are kept (about 500 panics at 30 KB each).
+function pstore-info() {
+  local OUT="$TMPDIR/pstore" PSTORE_MAX_BYTES=16777216 SIZE NOTE=""
+
+  if ! command -v journalctl >/dev/null 2>&1; then
+    return 0
   fi
+
+  mkdir -p "$OUT"
+  journalctl --no-pager -a -t systemd-pstore _UID=0 -o verbose --output-fields=FILE 2> "$OUT/journalctl.err" | tail -c "$PSTORE_MAX_BYTES" > "$OUT/records" || true
+  if ! grep -q '^    FILE=' "$OUT/records" 2>/dev/null; then
+    if [ -s "$OUT/journalctl.err" ]; then
+      techo "pstore records not collected: $(head -n 1 "$OUT/journalctl.err")"
+    fi
+    rm -rf "$OUT"
+    return 0
+  fi
+  if [ ! -s "$OUT/journalctl.err" ]; then
+    rm -f "$OUT/journalctl.err"
+  fi
+  SIZE="$(wc -c < "$OUT/records" | tr -d ' ')"
+  if [ "$SIZE" -ge "$PSTORE_MAX_BYTES" ]; then
+    NOTE=" (cut to the newest 16 MiB)"
+  fi
+  techo "Collected pstore records: $SIZE bytes$NOTE"
 }
 
 function gpu-info() {
@@ -2157,6 +2186,7 @@ var-log
 journald-log
 storage-info
 kdump-info
+pstore-info
 # gpu-info needs kubectl reachable (to fall back to `kubectl exec` when
 # rocm-smi/amd-smi aren't installed on the host — which is the norm on
 # Kairos), so set-kubeconfig has to run first.
