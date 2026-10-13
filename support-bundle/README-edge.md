@@ -295,32 +295,29 @@ All `launchpad.spectrocloud.com/v1alpha1` CRs are collected via the generic CRD 
 
 ### kdump Collection
 
-On hosts where kdump-tools is installed, the `kdump-info` step writes `kdump/`:
+On hosts with kdump-tools installed, the script writes `kdump/`:
 
-* `listing`: `/usr/local/kdump` and each capture directory (names, sizes, times)
-* `captures/<stamp>/dmesg.<stamp>`: the kernel log of each crashed kernel. This is kernel log text only, but it includes anything written to the kernel log before the crash
-* `kdump-config-status`, `kexec_crash_size`, `kexec_crash_loaded`: whether crash memory is reserved and the capture kernel is loaded
-* `crashkernel`: the `crashkernel=` value on the kernel command line
+* `captures/<stamp>/dmesg.<stamp>`: the kernel log of each crash that kdump captured
+* `listing`: the contents of `/usr/local/kdump` (names, sizes, times)
+* `kdump-config-status`, `kexec_crash_size`, `kexec_crash_loaded`, `crashkernel`: whether crash memory is reserved and the capture kernel is loaded
 * `kdump-tools.default`, `kdump-tools.override`, `kdump-tools`: image defaults, operator overrides and the generated configuration
-* `journal-kdump-tools`: journal of `kdump-tools` and `kdump-tools-dump`
+* `journal-kdump-tools`: the journal of the kdump services
 
-A `dmesg.*` larger than 32 MiB is not copied, and is reported only in `kdump/listing`.
-
-Dump files (`dump.<stamp>`, `dump-incomplete`, `vmcore-incomplete`, `vmcore.<stamp>`) are never collected: they are large and contain kernel memory. To retrieve a dump, follow the retrieval procedure in the kdump operator guide.
-
-The step is skipped on hosts without kdump-tools and never fails the bundle. The pstore records are collected by a separate step, below.
+Dump files (`dump.<stamp>`, `vmcore`) are never collected: they are large and contain kernel memory. A `dmesg.*` larger than 32 MiB is listed in `listing` but not copied. Hosts without kdump-tools get no `kdump/` directory.
 
 ### pstore Collection
 
-The `pstore-info` step writes `pstore/records` on every host whose journal holds `systemd-pstore` records, with or without kdump-tools. At the next boot after a panic, `systemd-pstore` writes each record to the journal unless `Storage=none` is set (checked on systemd 255, as on Ubuntu 24.04). The text therefore reaches the bundle on hosts with the default `Storage=external` as well as on hosts with `Storage=journal`, for example the FIPS, STIG and CIS Ubuntu 24.04 images built with the CanvOS pstore setting. On hosts without records the step writes nothing.
+After a kernel panic, the kernel saves the end of its log in firmware storage (UEFI variables or ACPI ERST). At the next boot, systemd-pstore moves it into the system journal (`journalctl -t systemd-pstore`). The script copies those journal entries to `pstore/records` in the bundle, because the normal journal export shows only the record names, not the text. The file exists only if the journal holds such records.
 
-* The file holds the journal `FILE` field of each record, which the short-format `journald/journalctl` omits (it shows only `PStore dmesg-...` names). It is exported with `journalctl -a -t systemd-pstore _UID=0 -o verbose --output-fields=FILE`; only entries written by root are taken, because any local process can log under that identifier. Every record starts with a header that carries the archive time and, in the `b=` part of the bracketed cursor, the id of the boot that archived the record (the boot after the panic, with the default `Unlink=yes`), followed by the kernel log text under a `Panic#N PartK` header. One panic is about 15 records and 30 KB. Match on a substring such as `Kernel panic - not syncing`: continuation lines are indented, so an anchored pattern does not match.
-* It covers every boot the journal retains. The `-s`, `-e`, `-S`, `-E` and `-l` flags and the default line limit do not trim it. Output above 16 MiB (about 500 panics) keeps the newest records, the oldest record can be cut, and the console line says so.
-* This is kernel log text only, but it includes anything written to the kernel log before the crash.
-* If `journalctl` writes to stderr and no record is collected, the console line names the first stderr line. Warnings that come with records are kept in `pstore/journalctl.err`.
-* Not covered: hosts where `systemd-pstore` does not archive to the journal (`Storage=none` leaves the records in `/sys/fs/pstore`, or the service is disabled), and records the journal has already deleted. On a host with a volatile journal the records stay in the bundle only until the next reboot. The step does not read `/sys/fs/pstore` or `/var/lib/systemd/pstore`.
+| Situation | Panic log on the host | In the bundle |
+|---|---|---|
+| Panic, kdump not installed, not enabled, or capture kernel not loaded (for example FIPS, STIG and CIS images) | journal | `pstore/records` |
+| Panic, kdump enabled and loaded | `/usr/local/kdump/<stamp>/dmesg.<stamp>`; the kernel hands the crash to kdump before it writes pstore, so there is no pstore record | `kdump/captures/<stamp>/dmesg.<stamp>` |
+| Clean reboot, power loss, hard reset | nothing was stored | - |
+| Legacy BIOS boot without ACPI ERST | the host has no pstore storage | - |
+| Journal deleted, or `Storage=none` in `pstore.conf` | not available | - |
 
-The step never fails the bundle.
+A panic is stored as about 15 records; search the file for `Kernel panic - not syncing`. The records are in the bundle taken after the reboot that follows the panic, for as long as the journal keeps them.
 
 ### MongoDB Collection (Enterprise Clusters Only)
 
