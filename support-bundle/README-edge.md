@@ -293,6 +293,32 @@ All `launchpad.spectrocloud.com/v1alpha1` CRs are collected via the generic CRD 
 #### Kernel evidence (previous boot)
 * `dmesg-previous-boot` and `journalctl-previous-boot` — full kernel log from the boot BEFORE this one. Present only when journald has persistent storage (`/var/log/journal/` populated). Critical for post-crash forensics: if a GPU wedge caused the host to lose networking and reboot, the surviving evidence is here.
 
+### kdump Collection
+
+On hosts with kdump-tools installed, the script writes `kdump/`:
+
+* `captures/<stamp>/dmesg.<stamp>`: the kernel log of each crash that kdump captured
+* `listing`: the contents of `/usr/local/kdump` (names, sizes, times)
+* `kdump-config-status`, `kexec_crash_size`, `kexec_crash_loaded`, `crashkernel`: whether crash memory is reserved and the capture kernel is loaded
+* `kdump-tools.default`, `kdump-tools.override`, `kdump-tools`: image defaults, operator overrides and the generated configuration
+* `journal-kdump-tools`: the journal of the kdump services
+
+Dump files (`dump.<stamp>`, `vmcore`) are never collected: they are large and contain kernel memory. A `dmesg.*` larger than 32 MiB is listed in `listing` but not copied. Hosts without kdump-tools get no `kdump/` directory.
+
+### pstore Collection
+
+After a kernel panic, the kernel saves the end of its log in firmware storage (UEFI variables or ACPI ERST). At the next boot, systemd-pstore moves it into the system journal (`journalctl -t systemd-pstore`). The script copies those journal entries to `pstore/records` in the bundle, because the normal journal export shows only the record names, not the text. The file exists only if the journal holds such records.
+
+| Situation | Panic log on the host | In the bundle |
+|---|---|---|
+| Panic, kdump not installed, not enabled, or capture kernel not loaded (for example FIPS, STIG and CIS images) | journal | `pstore/records` |
+| Panic, kdump enabled and loaded | `/usr/local/kdump/<stamp>/dmesg.<stamp>`; the kernel hands the crash to kdump before it writes pstore, so there is no pstore record | `kdump/captures/<stamp>/dmesg.<stamp>` |
+| Clean reboot, power loss, hard reset | nothing was stored | - |
+| Legacy BIOS boot without ACPI ERST | the host has no pstore storage | - |
+| Journal deleted, or `Storage=none` in `pstore.conf` | not available | - |
+
+A panic is stored as about 15 records; search the file for `Kernel panic - not syncing`. The records are in the bundle taken after the reboot that follows the panic, for as long as the journal keeps them.
+
 ### MongoDB Collection (Enterprise Clusters Only)
 
 For Enterprise and PCG clusters, the script collects MongoDB replica set information:

@@ -626,6 +626,112 @@ function storage-info() {
   fi
 }
 
+# kdump (PE-9067): state, configuration and the kernel log of each capture.
+# Runs only where kdump-tools is installed. Copies dmesg.* only: dumps
+# (dump.*, dump-incomplete, vmcore-incomplete) are never collected. The pstore
+# records are collected separately, by pstore-info.
+function kdump-info() {
+  local KDUMP_DIR=/usr/local/kdump DMESG_MAX=33554432
+  local KDUMP_CONFIG OUT D F SIZE
+
+  KDUMP_CONFIG="$(command -v kdump-config 2>/dev/null || true)"
+  if [ -z "$KDUMP_CONFIG" ] && [ -x /usr/sbin/kdump-config ]; then
+    KDUMP_CONFIG=/usr/sbin/kdump-config
+  fi
+  if [ -z "$KDUMP_CONFIG" ]; then
+    return 0
+  fi
+
+  techo "Collecting kdump state"
+  OUT="$TMPDIR/kdump"
+  mkdir -p "$OUT"
+
+  if [ -d "$KDUMP_DIR" ]; then
+    {
+      ls -la "$KDUMP_DIR" || true
+      for D in "$KDUMP_DIR"/*; do
+        if [ -L "$D" ] || [ ! -d "$D" ]; then
+          continue
+        fi
+        echo
+        ls -la "$D" || true
+      done
+    } > "$OUT/listing" 2>&1
+
+    for F in "$KDUMP_DIR"/*/dmesg.*; do
+      if [ ! -f "$F" ] || [ -L "$F" ] || [ -L "$(dirname "$F")" ]; then
+        continue
+      fi
+      SIZE="$(stat -c %s "$F" 2>/dev/null || true)"
+      if [ -z "$SIZE" ]; then
+        echo "size unknown for $F: copied without the size check" >> "$OUT/listing"
+      elif [ "$SIZE" -gt "$DMESG_MAX" ]; then
+        echo "skipped $F: $SIZE bytes" >> "$OUT/listing"
+        continue
+      fi
+      D="$OUT/captures/$(basename "$(dirname "$F")")"
+      mkdir -p "$D" && { cp -p "$F" "$D/" 2>&1 || true; }
+    done
+  fi
+
+  timeout 30 "$KDUMP_CONFIG" status > "$OUT/kdump-config-status" 2>&1 || true
+
+  for F in kexec_crash_size kexec_crash_loaded; do
+    if [ -e "/sys/kernel/$F" ]; then
+      cat "/sys/kernel/$F" > "$OUT/$F" 2>&1 || true
+    fi
+  done
+
+  if ! grep -o 'crashkernel=[^ ]*' /proc/cmdline > "$OUT/crashkernel" 2>/dev/null; then
+    echo "no crashkernel= on the kernel command line" > "$OUT/crashkernel"
+  fi
+
+  for F in /etc/default/kdump-tools.default /etc/default/kdump-tools.override /etc/default/kdump-tools; do
+    if [ -f "$F" ]; then
+      cp -p "$F" "$OUT/" 2>&1 || true
+    fi
+  done
+
+  # shellcheck disable=SC2086 # JOURNALD_FLAGS is a flag list, split on purpose
+  journalctl --no-pager -u kdump-tools -u kdump-tools-dump $JOURNALD_FLAGS > "$OUT/journal-kdump-tools" 2>&1 || true
+}
+
+# pstore records (PE-9067): the kernel log of each panic, as logged by
+# systemd-pstore into the journal at the next boot (every Storage= setting but
+# none). Independent of kdump-tools: runs wherever the journal holds records
+# and creates nothing otherwise. The short-format journald/journalctl shows only
+# the "PStore dmesg-..." names; the text is in the FILE field, so it is exported
+# here in verbose format (archive time and boot id per record). Only entries
+# written by root are taken (_UID=0): any local process can log under the
+# systemd-pstore identifier. JOURNALD_FLAGS is ignored on purpose: these records
+# are the evidence an operator who trims the journal needs most. The newest
+# PSTORE_MAX_BYTES are kept (about 500 panics at 30 KB each).
+function pstore-info() {
+  local OUT="$TMPDIR/pstore" PSTORE_MAX_BYTES=16777216 SIZE NOTE=""
+
+  if ! command -v journalctl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  mkdir -p "$OUT"
+  journalctl --no-pager -a -t systemd-pstore _UID=0 -o verbose --output-fields=FILE 2> "$OUT/journalctl.err" | tail -c "$PSTORE_MAX_BYTES" > "$OUT/records" || true
+  if ! grep -q '^    FILE=' "$OUT/records" 2>/dev/null; then
+    if [ -s "$OUT/journalctl.err" ]; then
+      techo "pstore records not collected: $(head -n 1 "$OUT/journalctl.err")"
+    fi
+    rm -rf "$OUT"
+    return 0
+  fi
+  if [ ! -s "$OUT/journalctl.err" ]; then
+    rm -f "$OUT/journalctl.err"
+  fi
+  SIZE="$(wc -c < "$OUT/records" | tr -d ' ')"
+  if [ "$SIZE" -ge "$PSTORE_MAX_BYTES" ]; then
+    NOTE=" (cut to the newest 16 MiB)"
+  fi
+  techo "Collected pstore records: $SIZE bytes$NOTE"
+}
+
 function gpu-info() {
   # Collect GPU host state for AI/inference appliances (launchpad-ai and other
   # GPU-bearing edge nodes). Emits an empty gpu/ directory on nodes with no
@@ -2079,6 +2185,8 @@ networking-info
 var-log
 journald-log
 storage-info
+kdump-info
+pstore-info
 # gpu-info needs kubectl reachable (to fall back to `kubectl exec` when
 # rocm-smi/amd-smi aren't installed on the host — which is the norm on
 # Kairos), so set-kubeconfig has to run first.
