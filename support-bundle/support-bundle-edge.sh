@@ -1670,6 +1670,9 @@ function kubeadm-certs() {
       if [ -d /var/lib/kubelet/pki ]; then
         ls -lah --time-style=full-iso /var/lib/kubelet/pki/ > $TMPDIR/etc/kubernetes/pki/kubelet/files 2>&1
         summarize-certs /var/lib/kubelet/pki "$TMPDIR/etc/kubernetes/pki/kubelet-cert-expiry-summary"
+        # rotateCertificates / serverTLSBootstrap: with rotation on, kubelet.conf's embedded
+        # client cert (kubeconfig-cert-expiry) is never renewed but is checked at kubelet startup
+        cp -p /var/lib/kubelet/config.yaml $TMPDIR/etc/kubernetes/pki/kubelet/config.yaml 2>/dev/null
       fi
 
       KUBECONFIGS=(/etc/kubernetes/admin.conf /etc/kubernetes/super-admin.conf /etc/kubernetes/controller-manager.conf
@@ -1845,7 +1848,7 @@ function cert-renewal-state() {
   mkdir -p "$OUT"
 
   kubectl get secret -A -l spectrocloud.com/cert-details \
-    -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,CREATED:.metadata.creationTimestamp,PROGRESS:.metadata.annotations.spectrocloud\.com/cert-renewal-progress' \
+    -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,CREATED:.metadata.creationTimestamp,PLAN:.metadata.labels.spectrocloud\.com/cert-renew-plan,PROGRESS:.metadata.annotations.spectrocloud\.com/cert-renewal-progress' \
     > "$OUT/cert-details-secrets" 2>&1
 
   while read -r NS NAME; do

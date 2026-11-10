@@ -93,7 +93,8 @@ one row per certificate with its validity window and `EXPIRED`, `EXPIRES <30d` o
 * kubeadm PKI under `/etc/kubernetes/pki` including etcd, and any `pki.bak*` /
   `pki-backup*` copy left by a manual renewal
 * kubelet certificates under `/var/lib/kubelet/pki`, including the rotated
-  `kubelet-client-current.pem`
+  `kubelet-client-current.pem`, and the kubelet `config.yaml`
+  (`rotateCertificates`)
 * the client certificates embedded in or referenced by the component kubeconfigs
   (`admin.conf`, `controller-manager.conf`, `scheduler.conf`, `kubelet.conf`,
   `/run/kubeconfig`, `KUBECONFIG`)
