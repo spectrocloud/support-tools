@@ -216,7 +216,8 @@ function k8s-resources() {
   techo "Collecting k8s cluster-info"
   mkdir -p "${TMPDIR}/k8s/cluster-info"
   kubectl version -o yaml > "${TMPDIR}/k8s/cluster-info/cluster-version.yaml" 2>&1
-  kubectl cluster-info > "${TMPDIR}/k8s/cluster-info/cluster-info" 2>&1
+  # With the real kubeconfig: through the proxy this would show the proxy's address.
+  KUBECONFIG="${REAL_KUBECONFIG:-$KUBECONFIG}" kubectl cluster-info > "${TMPDIR}/k8s/cluster-info/cluster-info" 2>&1
 
   techo "Collecting k8s cluster-info dump"
   mkdir -p "${TMPDIR}/k8s/cluster-info/dump"
@@ -295,6 +296,120 @@ function k8s-resources() {
       fi
     done
   done
+}
+
+# Each kubectl call authenticates and opens a new TLS connection, re-running any exec-plugin
+# (aws-iam-authenticator, gke-gcloud-auth-plugin, kubelogin, ...) every time. One `kubectl proxy`
+# authenticates once and holds the connection; the script reaches it over loopback with a
+# credential-free kubeconfig. Disable with -P.
+USE_PROXY=true
+PROXY_PID=""
+PROXY_DIR=""
+REAL_KUBECONFIG=""
+
+function proxy-start() {
+  [[ "$USE_PROXY" == true ]] || return 0
+  command -v kubectl >/dev/null 2>&1 || return 0
+
+  # Authenticate in the foreground first, so a plugin needing an interactive login (SSO, device
+  # code) can prompt and cache it; the proxy itself has no terminal.
+  if ! kubectl get --raw=/version >/dev/null; then
+    techo "kubectl proxy: the cluster is not reachable with the current kubeconfig; not using the proxy"
+    return 0
+  fi
+
+  PROXY_DIR=$(mktemp -d $MKTEMP_BASEDIR) || { PROXY_DIR=""; return 0; }
+  # --port=0 picks a free port and prints it. --reject-paths keeps exec (the MongoDB collection
+  # needs it) but rejects attach; --reject-methods makes the loopback port read-only.
+  command kubectl proxy --address=127.0.0.1 --port=0 \
+    --reject-paths='^/api/.*/pods/.*/attach' --reject-methods='PUT,PATCH,DELETE' \
+    </dev/null >"$PROXY_DIR/proxy.log" 2>&1 &
+  PROXY_PID=$!
+
+  local PORT="" LOG="" i
+  for ((i = 0; i < 150; i++)); do
+    LOG=$(<"$PROXY_DIR/proxy.log")
+    if [[ "$LOG" =~ Starting\ to\ serve\ on\ 127\.0\.0\.1:([0-9]+) ]]; then
+      PORT="${BASH_REMATCH[1]}"
+      break
+    fi
+    kill -0 "$PROXY_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [[ -z "$PORT" ]]; then
+    techo "kubectl proxy did not start; connecting directly. Proxy output: ${LOG}"
+    proxy-stop
+    return 0
+  fi
+
+  # Keep the context's default namespace, for calls that pass an empty -n.
+  local CONTEXT_NS
+  CONTEXT_NS=$(command kubectl config view --minify -o jsonpath='{.contexts[0].context.namespace}' 2>/dev/null)
+  cat > "$PROXY_DIR/kubeconfig" <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: kubectl-proxy
+  cluster:
+    server: http://127.0.0.1:${PORT}
+users:
+- name: kubectl-proxy
+  user: {}
+contexts:
+- name: kubectl-proxy
+  context:
+    cluster: kubectl-proxy
+    user: kubectl-proxy
+    namespace: ${CONTEXT_NS:-default}
+current-context: kubectl-proxy
+EOF
+
+  # The proxy gets its credential on the first request; check that works before relying on it.
+  if ! KUBECONFIG="$PROXY_DIR/kubeconfig" command kubectl get --raw=/version >/dev/null 2>&1; then
+    techo "kubectl proxy is not serving requests; connecting directly. Proxy output: $(<"$PROXY_DIR/proxy.log")"
+    proxy-stop
+    return 0
+  fi
+
+  REAL_KUBECONFIG="$KUBECONFIG"
+  export KUBECONFIG="$PROXY_DIR/kubeconfig"
+  techo "Using kubectl proxy on 127.0.0.1:${PORT}: one connection and one credential for the whole run (-P to disable)"
+
+  # From here each kubectl call checks the proxy is still up (kill is a builtin) and connects
+  # directly if not, so a dead proxy can't empty the rest of the bundle. Defined only now so the
+  # `command -v kubectl` check above still sees the real binary.
+  function kubectl() {
+    if [[ -n "$PROXY_PID" ]] && ! kill -0 "$PROXY_PID" 2>/dev/null; then
+      proxy-lost
+    fi
+    command kubectl "$@"
+  }
+}
+
+function proxy-lost() {
+  PROXY_PID=""
+  export KUBECONFIG="$REAL_KUBECONFIG"
+  # May run inside $(...), whose stdout is captured, so record to a file instead of printing.
+  [[ -e "$PROXY_DIR/lost" ]] || timestamp > "$PROXY_DIR/lost"
+}
+
+function proxy-stop() {
+  [[ -n "$PROXY_DIR" ]] || return 0
+  if [[ -n "$PROXY_PID" ]]; then
+    kill "$PROXY_PID" 2>/dev/null
+    wait "$PROXY_PID" 2>/dev/null
+    PROXY_PID=""
+  fi
+  if [[ -e "$PROXY_DIR/lost" ]]; then
+    techo "kubectl proxy exited during the run (noticed $(<"$PROXY_DIR/lost")); later calls connected directly"
+  fi
+  if [[ -n "$TMPDIR_BASE" && -d "$TMPDIR" && -n "$REAL_KUBECONFIG" ]]; then
+    techo "Collected through kubectl proxy (its output: kubectl-proxy.log)"
+    cp "$PROXY_DIR/proxy.log" "$TMPDIR/kubectl-proxy.log" 2>/dev/null
+  fi
+  [[ -n "$REAL_KUBECONFIG" ]] && export KUBECONFIG="$REAL_KUBECONFIG"
+  rm -rf "$PROXY_DIR"
+  PROXY_DIR=""
 }
 
 function timestamp() {
@@ -509,13 +624,14 @@ function help() {
   -n    Additional namespaces to collect logs from. (ex: -n hello-universe,hello-world)
   -r    Additional namespace scoped resources to collect. (ex: -r certificates.cert-manager.io,clusterissuers.cert-manager.io)
   -R    Additional cluster scoped resources to collect. (ex: -R clusterissuers.cert-manager.io,clusterissuers.cert-manager.io)
+  -P    Do not use kubectl proxy; every kubectl call connects to the API server directly.
 
   "
 
 
 }
 
-while getopts "d:n:r:R:h" opt; do
+while getopts "d:n:r:R:Ph" opt; do
   case $opt in
   d)
     MKTEMP_BASEDIR="-p ${OPTARG}"
@@ -542,6 +658,10 @@ while getopts "d:n:r:R:h" opt; do
       API_RESOURCES+=("$RESOURCE")
     done
     ;;
+  P)
+    USE_PROXY=false
+    techo "Not using kubectl proxy"
+    ;;
   h)
     help && exit 0
     ;;
@@ -552,10 +672,17 @@ while getopts "d:n:r:R:h" opt; do
 done
 
 is-kubeconfig-set || { echo "KUBECONFIG is not set. Unable to collect Kubernetes logs."; cleanup; exit 1; }
+# Stop the proxy however the script ends. Without job control a background process ignores
+# Ctrl-C, so the proxy would otherwise outlive an interrupted run.
+trap proxy-stop EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+proxy-start
 spectro-k8s-defaults
 setup
 validate-namespace-coverage
 k8s-resources
 mongo-status
+proxy-stop
 archive
 cleanup

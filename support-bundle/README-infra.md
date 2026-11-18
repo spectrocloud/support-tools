@@ -46,10 +46,28 @@ All flags are optional:
 | `-n` | Additional namespaces to collect logs from. | `-n hello-universe,hello-world` |
 | `-r` | Additional namespace scoped resources to collect. | `-r certificates.cert-manager.io,clusterissuers.cert-manager.io` |
 | `-R` | Additional cluster scoped resources to collect. | `-R clusterissuers.cert-manager.io,clusterissuers.cert-manager.io` |
+| `-P` | Do not use `kubectl proxy`; every `kubectl` call connects to the API server directly. | `-P` |
 
 ## Environment Variables
 
 * `KUBECONFIG`: Path to the Kubernetes configuration file
+
+## kubectl proxy
+
+The script makes several hundred `kubectl` calls. Each call is a new process that authenticates and
+opens a new TLS connection to the API server. With exec-plugin authentication (`aws eks get-token`,
+`aws-iam-authenticator`, `gke-gcloud-auth-plugin`, `kubelogin`) each call also runs the plugin.
+
+By default the script starts one `kubectl proxy` for the run, so it authenticates once and keeps one
+connection open. The `kubectl` calls go to the proxy over loopback with a temporary kubeconfig that
+holds no credentials. The bundle contents are the same.
+
+* The proxy listens on `127.0.0.1` only, on a free port, and stops when the script ends, including
+  on Ctrl-C. It rejects `PUT`, `PATCH`, `DELETE` and `attach`.
+* While the script runs, other users logged in to the same machine could reach the port. On a
+  shared machine (a shared jump host, a multi-session VDI) use `-P`.
+* If the proxy cannot start, or stops during the run, the script connects directly and says so.
+  The proxy's output is in `kubectl-proxy.log` in the bundle.
 
 
 ## Output
