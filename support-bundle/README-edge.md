@@ -55,6 +55,28 @@ All flags are optional:
 | `-r` | Additional namespace scoped resources | `-r certificates.cert-manager.io` |
 | `-R` | Additional cluster scoped resources | `-R clusterissuers.cert-manager.io` |
 | `-j` | Additional journald logs to collect | `-j cloud-init,systemd-resolved` |
+| `-P` | Do not use `kubectl proxy`; every `kubectl` call connects to the API server directly. | `-P` |
+
+## kubectl proxy
+
+The cluster-resource part of the bundle makes many `kubectl` calls. Each call is a new process that
+authenticates and opens a new TLS connection to the API server. By default the script starts one
+`kubectl proxy` for the run, so it authenticates once and keeps one connection open; the `kubectl`
+calls go to the proxy over loopback with a temporary kubeconfig that holds no credentials. The
+bundle contents are the same.
+
+Run on the node (the usual case) this makes little difference — the node talks to a local API
+server over a certificate. It matters when the collector is run from **outside** the node against
+the cluster API, where the per-call connection setup adds up.
+
+* The proxy listens on `127.0.0.1` only, on a free port, and stops when the script ends, including
+  on Ctrl-C. It rejects `PUT`, `PATCH`, `DELETE` and `attach`.
+* It starts only when the API server is reachable (after the reachability gate); if the API is
+  unusable the script skips it along with the rest of cluster collection.
+* While the script runs, other users logged in to the same machine could reach the port. On a
+  shared machine use `-P`.
+* If the proxy cannot start, or stops during the run, the script connects directly and says so.
+  The proxy's output is in `kubectl-proxy.log` in the bundle.
 
 ## Environment Variables
 
