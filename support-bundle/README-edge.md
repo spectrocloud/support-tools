@@ -111,7 +111,8 @@ certificate is copied raw; the bundle contains parsed text only.
 ## Important Notes
 
 * Secrets are not collected as part of the support bundle
-* Only helm release secrets for the spectrocloud namespaces are collected
+* On Enterprise and PCG clusters, logs, resources and Helm release secrets are collected only
+  from Spectro Cloud namespaces, not from customer namespaces. Use `-n` to add more namespaces.
 * The script automatically detects the Kubernetes distribution (kubeadm, k3s, or rke2)
 * Collected logs are stored in `/opt/spectrocloud/logs/` by default
 

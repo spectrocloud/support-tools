@@ -156,6 +156,8 @@ For Enterprise and PCG clusters, the script collects MongoDB replica set informa
 ## Important Notes
 
 * The script requires proper kubectl access to the cluster
+* On Enterprise and PCG clusters, logs, resources and Helm release secrets are collected only
+  from Spectro Cloud namespaces, not from customer namespaces. Use `-n` to add more namespaces.
 * Collected information is focused on infrastructure and cluster-level resources
 * The script is designed to be run from a management cluster or a system with cluster access
 * All collected data is stored in a temporary directory before being archived

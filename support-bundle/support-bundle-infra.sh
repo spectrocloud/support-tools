@@ -19,6 +19,12 @@ SB_VERSION=20251117+16d5f3c
 # set -x
 
 SYSTEM_NAMESPACES=(amd-gpu-operator capa-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-system capi-webhook-system cert-manager default gpu-operator grafana harbor headlamp keycloak konveyor-forklift kube-system kube-public kubernetes-dashboard kubevirt launchpad-ai longhorn-system metallb-system os-patch palette-system piraeus-system reach-system rook-ceph spectro-system spectro-task system-upgrade traefik victoria-metrics vm-dashboard zot-system)
+# Enterprise (self-hosted Palette / VerteX) and PCG clusters only collect from the Spectro namespaces below.
+# Reference: https://docs.spectrocloud.com/architecture/palette-namespaces-pods/
+ENTERPRISE_NAMESPACES=(capi-webhook-system cert-manager cp-system hubble-system imageswap-system ingress-nginx ingress-traefik jet-system kube-public kube-system os-patch palette-system piraeus-system reach-system spectro-mgmt ui-system zot-system)
+PCG_NAMESPACES=(capi-webhook-system cert-manager jet-system kube-public kube-system os-patch palette-system reach-system)
+# Namespaces passed with -n
+EXTRA_NAMESPACES=()
 
 API_RESOURCES=(apiservices clusterroles clusterrolebindings crds csr mutatingwebhookconfigurations namespaces nodes priorityclasses pv storageclasses validatingwebhookconfigurations volumeattachments)
 
@@ -41,19 +47,22 @@ function spectro-k8s-defaults() {
 	if kubectl get ns --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null | grep 'hubble-system'; then
 		IS_ENTERPRISE_CLUSTER=true
     CLUSTER_NAME="spectro-enterprise-cluster"
-		techo "This is an Enterprise cluster. Collecting logs from all namespaces"
+		techo "This is an Enterprise cluster. Collecting logs from Spectro namespaces"
 	fi
 
 	IS_PCG_CLUSTER=false
 	if [[ "$IS_ENTERPRISE_CLUSTER" == false ]] && kubectl get deployment -n jet-system --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null | grep 'jet'; then
 		IS_PCG_CLUSTER=true
     CLUSTER_NAME="spectro-pcg-cluster"
-		techo "This is a PCG cluster. Collecting logs from all namespaces"
+		techo "This is a PCG cluster. Collecting logs from Spectro namespaces"
 	fi
 
-  if [[ "$IS_ENTERPRISE_CLUSTER" == true ]] || [[ "$IS_PCG_CLUSTER" == true ]]; then
-		SYSTEM_NAMESPACES=($(kubectl get ns --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null))
-    return 0
+  # Enterprise and PCG clusters use their own namespace list instead of SYSTEM_NAMESPACES.
+  # cluster-<uid>, spectro-task-<uid> and system-upgrade-<uid> are still discovered below.
+  if [[ "$IS_ENTERPRISE_CLUSTER" == true ]]; then
+    SYSTEM_NAMESPACES=("${ENTERPRISE_NAMESPACES[@]}" "${EXTRA_NAMESPACES[@]}")
+  elif [[ "$IS_PCG_CLUSTER" == true ]]; then
+    SYSTEM_NAMESPACES=("${PCG_NAMESPACES[@]}" "${EXTRA_NAMESPACES[@]}")
   fi
 
   for NS in "${SYSTEM_NAMESPACES[@]}"; do
@@ -104,6 +113,11 @@ function spectro-k8s-defaults() {
       techo "Adding namespace $NS for logs collection."
       SYSTEM_NAMESPACES+=("$NS")
     done
+  fi
+
+  # Enterprise and PCG clusters keep the CLUSTER_NAME set above
+  if [[ "$IS_ENTERPRISE_CLUSTER" == true ]] || [[ "$IS_PCG_CLUSTER" == true ]]; then
+    return 0
   fi
 
   CLUSTER_NAME=$(kubectl get spc -n "${CLUSTER_NS}" --output=custom-columns="Name:.metadata.name" --no-headers 2>/dev/null)
@@ -526,6 +540,7 @@ while getopts "d:n:r:R:h" opt; do
     techo "Collecting logs for additional namespaces $NAMESPACES"
     for NS in $(echo $NAMESPACES | tr "," "\n"); do
       SYSTEM_NAMESPACES+=("$NS")
+      EXTRA_NAMESPACES+=("$NS")
     done
     ;;
   r)
