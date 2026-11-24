@@ -279,6 +279,8 @@ All `launchpad.spectrocloud.com/v1alpha1` CRs are collected via the generic CRD 
 * `rocm-smi -a` and `rocm-smi --showhw --showdriverversion --showvbios --showtemp --showuse --showpower --showfw --showbios` — sourced from the host if `rocm-smi` is installed, else via `kubectl exec` into any pod in `amd-gpu-operator` or `launchpad-ai` that has the tool
 * AMD GPU device coredumps from `/var/log/amdgpu-devcoredump/` (populated by the udev rule shipped in the AMD OS profile — the ONLY forensic evidence available for post-mortem RCA of SDMA/GFX/KIQ ring hangs, since kernel devcoredumps are otherwise freed on read/timeout/reboot)
 * Live sysfs devcoredump listing (`/sys/class/devcoredump/`)
+* CPER hardware error records via `amd-smi ras --cper` → `gpu/amd/amd-smi-ras-cper.txt` (host binary if present, else via `kubectl exec` into a pod in `amd-gpu-operator` or `launchpad-ai`)
+* GPU-related environment variables from running pods in `amd-gpu-operator` and `launchpad-ai` → `gpu/pod-env/<ns>_<pod>_<container>.txt`. Only allow-listed prefixes are collected (`HSA_*`, `ROCR_*`, `HIP_*`, `ROCM_*`, `NCCL_*`, `RCCL_*`, `AMD_*`, `GPU_DEVICE_ORDINAL`); any name containing KEY/TOKEN/SECRET/PASS/CRED is dropped, so no secret data enters the bundle
 
 #### NVIDIA (nvidia driver) — collected when `/proc/driver/nvidia` exists or `nvidia-smi` is present
 * Driver version from `/proc/driver/nvidia/version`
