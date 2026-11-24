@@ -775,6 +775,7 @@ function gpu-info() {
       timeout 30 "$AMD_SMI_BIN" firmware > "$TMPDIR/gpu/amd/amd-smi-firmware.txt" 2>&1 || true
       timeout 30 "$AMD_SMI_BIN" bad-pages > "$TMPDIR/gpu/amd/amd-smi-bad-pages.txt" 2>&1 || true
       timeout 30 "$AMD_SMI_BIN" topology > "$TMPDIR/gpu/amd/amd-smi-topology.txt" 2>&1 || true
+      timeout 30 "$AMD_SMI_BIN" ras --cper > "$TMPDIR/gpu/amd/amd-smi-ras-cper.txt" 2>&1 || true
     fi
 
     # If neither is on the host, try inside any candidate pod.
@@ -801,6 +802,7 @@ function gpu-info() {
               timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" firmware > "$TMPDIR/gpu/amd/amd-smi-firmware.txt" 2>&1 || true
               timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" bad-pages > "$TMPDIR/gpu/amd/amd-smi-bad-pages.txt" 2>&1 || true
               timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" topology > "$TMPDIR/gpu/amd/amd-smi-topology.txt" 2>&1 || true
+              timeout 30 kubectl -n "$NS" exec "$CAND" -- "$POD_AMD_SMI" ras --cper > "$TMPDIR/gpu/amd/amd-smi-ras-cper.txt" 2>&1 || true
             fi
             break 2
           fi
@@ -810,6 +812,26 @@ function gpu-info() {
 
     if [ -z "$ROCM_SMI_BIN" ] && [ -z "$AMD_SMI_BIN" ] && [ ! -s "$TMPDIR/gpu/amd/rocm-smi-all.txt" ] && [ ! -s "$TMPDIR/gpu/amd/amd-smi-list.txt" ]; then
       echo "rocm-smi / amd-smi not found on host or in any candidate pod (amd-gpu-operator/launchpad-ai). Searched: PATH, /opt/rocm/bin, /opt/rocm-*/bin, /usr/local/bin, /usr/bin." > "$TMPDIR/gpu/amd/rocm-smi-status"
+    fi
+
+    # GPU-relevant env vars from GPU workload pods
+    if [ "${SKIP_K8S_COLLECTION}" != "true" ] && command -v kubectl >/dev/null 2>&1; then
+      techo "Collecting GPU-related env vars from GPU workload pods"
+      mkdir -p "$TMPDIR/gpu/pod-env"
+      for NS in amd-gpu-operator launchpad-ai; do
+        for POD in $(timeout 15 kubectl -n "$NS" get pods --field-selector=status.phase=Running \
+                       -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+          for C in $(timeout 15 kubectl -n "$NS" get pod "$POD" \
+                       -o jsonpath='{.spec.containers[*].name}' 2>/dev/null); do
+            OUT="$TMPDIR/gpu/pod-env/${NS}_${POD}_${C}.txt"
+            timeout 10 kubectl -n "$NS" exec "$POD" -c "$C" -- env 2>/dev/null \
+              | grep -E '^(HSA_|ROCR_|HIP_|ROCM_|NCCL_|RCCL_|AMD_|GPU_DEVICE_ORDINAL=)' \
+              | grep -viE '(KEY|TOKEN|SECRET|PASS|CRED)' \
+              | sort > "$OUT" || true
+            [ -s "$OUT" ] || rm -f "$OUT"
+          done
+        done
+      done
     fi
 
     # devcoredumps (preserved by /oem udev rule — see launchpad-ai PRs #512, #530)
