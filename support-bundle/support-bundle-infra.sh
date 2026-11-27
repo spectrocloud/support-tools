@@ -482,7 +482,8 @@ function setup() {
 }
 
 # Mask registry credentials in every collected text file before archiving:
-# passwords, auth / identity tokens, .dockerconfigjson and https://user:pass@host.
+# passwords, auth / identity tokens, .dockerconfigjson, https://user:pass@host,
+# curl -u user:pass and Authorization: Basic|Bearer headers.
 # Only values are replaced (keys stay), so the bundle still shows which registries
 # have credentials configured. Covers YAML (stylus /oem registry blocks, pack
 # values in CRs), TOML (containerd registry auth), JSON (incl. escaped
@@ -502,11 +503,13 @@ s/^([[:space:]]*(-[[:space:]]+)?([A-Za-z0-9_.-]*(password|passwd)[A-Za-z0-9_.-]*
 s/^([[:space:]]*([A-Za-z0-9_.-]*(password|passwd)[A-Za-z0-9_.-]*|auth|identitytoken|identity_token)[[:space:]]*=[[:space:]]*)("[^"]+"|'[^']+')/\1"REDACTED"/I
 s/(^|[^A-Za-z0-9_.-])(([A-Za-z0-9_.-]*(password|passwd)[A-Za-z0-9_.-]*|auth|identitytoken|identity_token)=)("[^"]+"|'[^']+'|[^[:space:]"',;&]+)/\1\2REDACTED/Ig
 s#(://[^/[:space:]:@"'\\]+):[^/[:space:]@"'\\]+@#\1:REDACTED@#g
+s/((^|[[:space:]])(-u|--user)([[:space:]]+|=)['"]?[^:[:space:]'"]+:)[^[:space:]'"]+/\1REDACTED/g
+s/(authorization:[[:space:]]*(basic|bearer)[[:space:]]+)[A-Za-z0-9+\/=._~-]+/\1REDACTED/Ig
 EOF
 
   techo "Redacting registry credentials in collected files"
   if ! grep -rlI --null --exclude=console.log \
-      -iE 'passw|auth|identity_?token|dockerc|://[^/[:space:]]+:[^/[:space:]]+@' "$root" 2>/dev/null \
+      -iE 'passw|auth|identity_?token|dockerc|://[^/[:space:]]+:[^/[:space:]]+@|(-u|--user)[[:space:]=]+[^[:space:]:]+:' "$root" 2>/dev/null \
       | xargs -0 -r sed -E -i -f "$rules"; then
     techo "WARNING: registry credential redaction reported errors; review the bundle before sharing it"
   fi
