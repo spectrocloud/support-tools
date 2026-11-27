@@ -481,9 +481,46 @@ function setup() {
   techo "Support Bundle Version: $SB_VERSION" > "$TMPDIR/.support-bundle"
 }
 
+# Mask registry credentials in every collected text file before archiving:
+# passwords, auth / identity tokens, .dockerconfigjson, https://user:pass@host,
+# curl -u user:pass and Authorization: Basic|Bearer headers.
+# Only values are replaced (keys stay), so the bundle still shows which registries
+# have credentials configured. Covers YAML (stylus /oem registry blocks, pack
+# values in CRs), TOML (containerd registry auth), JSON (incl. escaped
+# annotations) and KEY=value. Uses grep + sed only, so it also runs on hosts
+# without python. console.log is skipped: tee is still writing it and it only
+# holds this script's own output.
+function redact-registry-credentials() {
+  local root="${1:-$TMPDIR}"
+  local rules
+  rules=$(mktemp) || {
+    techo "WARNING: could not create redaction rules file; registry credentials were NOT redacted"
+    return 1
+  }
+  cat > "$rules" <<'EOF'
+s/(\\?"([A-Za-z0-9_.-]*(password|passwd)[A-Za-z0-9_.-]*|auth|identitytoken|identity_token|\.?dockerconfigjson|\.?dockercfg)\\?"[[:space:]]*:[[:space:]]*\\?")([^"\\]|\\[^"])+(\\?")/\1REDACTED\5/Ig
+s/^([[:space:]]*(-[[:space:]]+)?([A-Za-z0-9_.-]*(password|passwd)[A-Za-z0-9_.-]*|auth|identitytoken|identity_token|\.?dockerconfigjson|\.?dockercfg)[[:space:]]*:[[:space:]]+)("[^"]+"|'[^']+'|[^"'[:space:]|>].*)$/\1REDACTED/I
+s/^([[:space:]]*([A-Za-z0-9_.-]*(password|passwd)[A-Za-z0-9_.-]*|auth|identitytoken|identity_token)[[:space:]]*=[[:space:]]*)("[^"]+"|'[^']+')/\1"REDACTED"/I
+s/(^|[^A-Za-z0-9_.-])(([A-Za-z0-9_.-]*(password|passwd)[A-Za-z0-9_.-]*|auth|identitytoken|identity_token)=)("[^"]+"|'[^']+'|[^[:space:]"',;&]+)/\1\2REDACTED/Ig
+s#(://[^/[:space:]:@"'\\]+):[^/[:space:]@"'\\]+@#\1:REDACTED@#g
+s/((^|[[:space:]])(-u|--user)([[:space:]]+|=)['"]?[^:[:space:]'"]+:)[^[:space:]'"]+/\1REDACTED/g
+s/(authorization:[[:space:]]*(basic|bearer)[[:space:]]+)[A-Za-z0-9+\/=._~-]+/\1REDACTED/Ig
+EOF
+
+  techo "Redacting registry credentials in collected files"
+  if ! grep -rlI --null --exclude=console.log \
+      -iE 'passw|auth|identity_?token|dockerc|://[^/[:space:]]+:[^/[:space:]]+@|(-u|--user)[[:space:]=]+[^[:space:]:]+:' "$root" 2>/dev/null \
+      | xargs -0 -r sed -E -i -f "$rules"; then
+    techo "WARNING: registry credential redaction reported errors; review the bundle before sharing it"
+  fi
+  rm -f "$rules"
+}
+
 function archive() {
   techo "Creating archive ${LOGNAME}.tar.gz"
   techo "Please upload the support bundle to the support ticket"
+
+  redact-registry-credentials "$TMPDIR"
   
   # Restore original fds to close tee pipe and flush console.log
   exec 1>&3 2>&4
