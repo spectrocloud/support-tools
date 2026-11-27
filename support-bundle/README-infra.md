@@ -88,7 +88,7 @@ The script collects various types of information:
 
 This document provides transparency about the output collected when running the support bundle script. The collection is designed to gather necessary troubleshooting information while respecting privacy and security concerns.
 
-Where possible, output from the collection is sanitized. However, we recommend you check the log collection and remove or edit any sensitive data before sharing.
+Where possible, output from the collection is sanitized. Before the archive is created, registry credentials (passwords, `auth` / identity tokens, `.dockerconfigjson` values and `user:password@` in URLs) are replaced with `REDACTED` in every collected text file. However, we recommend you check the log collection and remove or edit any sensitive data before sharing.
 
 ### Cluster-level Collection
 
